@@ -21,7 +21,13 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include "soem/soem.h"  /* SOEM main header */
+
+/* SOEM header is only needed for the real hardware implementation.
+ * In simulation/stub mode it is not required (and may not be available
+ * on bare-metal or Windows targets without WinPcap). */
+#ifndef KRON_EC_SIM
+#include "soem/soem.h"
+#endif
 
 /* ── PDO data types ───────────────────────────────────────────────────────── */
 typedef enum {

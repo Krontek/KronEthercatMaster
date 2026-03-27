@@ -2,10 +2,11 @@
  * kronethercatmaster.c  --  KronEditor EtherCAT Master runtime (SOEM-backed)
  *
  * Implements kron_ec_init / kron_ec_pdo_read / kron_ec_pdo_write / kron_ec_close
- * using the Simple Open EtherCAT Master (SOEM) library.
+ * using the Simple Open EtherCAT Master (SOEM) library v2 (context-based API).
  *
- * Compile with: -I<soem_include_dir> and link with libsoem.a -lpthread
- * Do NOT compile when KRON_EC_SIM is defined (use the stubs in kronethercatmaster.h instead).
+ * Compile with: -I<soem_include_dir> -I<soem_osal_dir> -I<soem_oshw_dir>
+ * Link with: libsoem.a -lpthread
+ * Do NOT compile when KRON_EC_SIM is defined (use the stubs in kronethercatmaster.h).
  */
 
 #ifndef KRON_EC_SIM
@@ -20,12 +21,9 @@
 #include <pthread.h>
 #include <sys/time.h>
 
-/* ── Internal SOEM context ── */
-#define EC_TIMEOUTMON  500  /* ms — slave state monitor timeout */
-
-static char        g_IOmap[4096];
-static OSAL_THREAD_HANDLE g_ec_thread;
-static volatile int g_ec_thread_stop = 0;
+/* ── SOEM v2 context (one per master instance) ───────────────────────────── */
+static ecx_contextt g_ctx;
+static char         g_IOmap[4096];
 static KRON_EC_Config *g_cfg_ptr = NULL;
 
 /* ── helpers ──────────────────────────────────────────────────────────────── */
@@ -49,8 +47,8 @@ static uint8_t dtype_bitsize(KRON_EC_DataType dt) {
 
 /* Write an SDO value to a slave (blocking) */
 static int write_sdo(uint16_t slave, KRON_EC_SDO *sdo) {
-    int wkc = ec_SDOwrite(slave, sdo->index, sdo->subindex, FALSE,
-                          sdo->byte_size, &sdo->value, EC_TIMEOUTRXM);
+    int wkc = ecx_SDOwrite(&g_ctx, slave, sdo->index, sdo->subindex, FALSE,
+                           sdo->byte_size, &sdo->value, EC_TIMEOUTRXM);
     return (wkc > 0) ? KRON_EC_OK : KRON_EC_ERR_IO;
 }
 
@@ -59,16 +57,18 @@ static int write_sdo(uint16_t slave, KRON_EC_SDO *sdo) {
 int kron_ec_init(KRON_EC_Config *cfg) {
     if (!cfg || cfg->ifname[0] == '\0') return KRON_EC_ERR_INIT;
 
-    if (ec_init(cfg->ifname) <= 0) {
-        fprintf(stderr, "[kronec] ec_init('%s') failed\n", cfg->ifname);
+    memset(&g_ctx, 0, sizeof(g_ctx));
+
+    if (ecx_init(&g_ctx, cfg->ifname) <= 0) {
+        fprintf(stderr, "[kronec] ecx_init('%s') failed\n", cfg->ifname);
         return KRON_EC_ERR_INIT;
     }
 
     /* Discover slaves */
-    int found = ec_config_init(FALSE);
+    int found = ecx_config_init(&g_ctx);
     if (found <= 0) {
         fprintf(stderr, "[kronec] No EtherCAT slaves found on %s\n", cfg->ifname);
-        ec_close();
+        ecx_close(&g_ctx);
         return KRON_EC_ERR_NO_SLAVES;
     }
     fprintf(stderr, "[kronec] Found %d slave(s)\n", found);
@@ -77,14 +77,14 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     for (int si = 0; si < cfg->slave_count; si++) {
         KRON_EC_Slave *sl = &cfg->slaves[si];
         uint16_t pos = sl->position;   /* 1-based */
-        if (pos < 1 || pos > (uint16_t)ec_slavecount) continue;
+        if (pos < 1 || pos > (uint16_t)g_ctx.slavecount) continue;
 
         /* Clear existing PDO assignments */
         uint8_t zero8 = 0;
         /* RxPDO assign (0x1C12) */
-        ec_SDOwrite(pos, 0x1C12, 0x00, FALSE, 1, &zero8, EC_TIMEOUTRXM);
+        ecx_SDOwrite(&g_ctx, pos, 0x1C12, 0x00, FALSE, 1, &zero8, EC_TIMEOUTRXM);
         /* TxPDO assign (0x1C13) */
-        ec_SDOwrite(pos, 0x1C13, 0x00, FALSE, 1, &zero8, EC_TIMEOUTRXM);
+        ecx_SDOwrite(&g_ctx, pos, 0x1C13, 0x00, FALSE, 1, &zero8, EC_TIMEOUTRXM);
 
         /* NOTE: Full custom PDO mapping per slave requires vendor-specific
          * object dictionary entries.  Here we rely on the default PDO
@@ -93,28 +93,28 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     }
 
     /* Map all slaves to IOmap (inputs + outputs combined) */
-    ec_config_map(g_IOmap);
+    ecx_config_map_group(&g_ctx, g_IOmap, 0);
 
     /* Enable distributed clocks if requested */
     if (cfg->dc_enable) {
-        ec_configdc();
+        ecx_configdc(&g_ctx);
     }
 
     /* Wait for all slaves to reach SAFE-OP */
-    ec_statecheck(0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
+    ecx_statecheck(&g_ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
 
     /* Send one processdata cycle so slaves have fresh data */
-    ec_send_processdata();
-    ec_receive_processdata(EC_TIMEOUTRET);
+    ecx_send_processdata(&g_ctx);
+    ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
 
     /* Request OP state */
-    ec_slave[0].state = EC_STATE_OPERATIONAL;
-    ec_writestate(0);
-    ec_statecheck(0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+    g_ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
+    ecx_writestate(&g_ctx, 0);
+    ecx_statecheck(&g_ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
 
-    if (ec_slave[0].state != EC_STATE_OPERATIONAL) {
+    if (g_ctx.slavelist[0].state != EC_STATE_OPERATIONAL) {
         fprintf(stderr, "[kronec] Could not reach OP state\n");
-        ec_close();
+        ecx_close(&g_ctx);
         return KRON_EC_ERR_OP;
     }
 
@@ -133,41 +133,21 @@ int kron_ec_init(KRON_EC_Config *cfg) {
 
     g_cfg_ptr = cfg;
     fprintf(stderr, "[kronec] EtherCAT master running on %s, %d slave(s)\n",
-            cfg->ifname, ec_slavecount);
+            cfg->ifname, g_ctx.slavecount);
     return KRON_EC_OK;
 }
 
 /* ── PDO copy helpers ─────────────────────────────────────────────────────── */
 
-/*
- * Each PDO entry knows its var_ptr (PLC variable in shared memory).
- * We walk the slave's PDO list, look up the entry in the SOEM IOmap
- * by index/subindex, and copy between the IOmap and the variable.
- *
- * For inputs (TxPDO): IOmap → var_ptr
- * For outputs (RxPDO): var_ptr → IOmap
- */
-
 static void copy_pdo_entry(KRON_EC_PDO_Entry *e, uint16_t slave_pos, bool read_dir) {
     if (!e->var_ptr) return;
 
-    /* Look up the byte offset of this object in the IOmap via ec_slave */
-    /* SOEM maps inputs at ec_slave[pos].inputs and outputs at ec_slave[pos].outputs */
+    /* SOEM v2: inputs/outputs are in context's slavelist */
     uint8_t *base = read_dir
-        ? (uint8_t *)ec_slave[slave_pos].inputs
-        : (uint8_t *)ec_slave[slave_pos].outputs;
+        ? (uint8_t *)g_ctx.slavelist[slave_pos].inputs
+        : (uint8_t *)g_ctx.slavelist[slave_pos].outputs;
     if (!base) return;
 
-    /* For simple cases we iterate through the PDO objects SOEM has mapped.
-     * We use ec_slave[].SM[] and ec_slave[].SMtype[] to determine offsets.
-     * Simplified approach: trust var_ptr was set to point to the correct
-     * address in the SOEM IOmap directly (set during kron_ec_init). */
-
-    /* If var_ptr is already pointing into the IOmap buffer, a plain copy
-     * is not needed — the PLC will read/write directly through var_ptr.
-     * This is the approach used when kron_ec_init sets var_ptr = &g_IOmap[offset].
-     *
-     * For variables that live in the PLC SHM (separate buffer), we do a copy. */
     (void)e; (void)base; (void)read_dir;
     /* Actual offset resolution is done at init time — see kron_ec_pdo_read/write */
 }
@@ -176,23 +156,21 @@ static void copy_pdo_entry(KRON_EC_PDO_Entry *e, uint16_t slave_pos, bool read_d
 
 void kron_ec_pdo_read(KRON_EC_Config *cfg) {
     if (!cfg) return;
-    ec_send_processdata();
-    int wkc = ec_receive_processdata(EC_TIMEOUTRET);
+    ecx_send_processdata(&g_ctx);
+    int wkc = ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
     (void)wkc;
 
     /* Copy input PDO data from IOmap → PLC variables */
     for (int si = 0; si < cfg->slave_count; si++) {
         KRON_EC_Slave *sl = &cfg->slaves[si];
         uint16_t pos = sl->position;
-        if (pos < 1 || pos > (uint16_t)ec_slavecount) continue;
-        uint8_t *inputs = (uint8_t *)ec_slave[pos].inputs;
+        if (pos < 1 || pos > (uint16_t)g_ctx.slavecount) continue;
+        uint8_t *inputs = (uint8_t *)g_ctx.slavelist[pos].inputs;
         if (!inputs) continue;
 
         for (int i = 0; i < sl->pdo_count; i++) {
             KRON_EC_PDO_Entry *e = &sl->pdo_entries[i];
             if (e->dir != KRON_EC_DIR_INPUT || !e->var_ptr) continue;
-            /* var_ptr holds the byte offset from slave input base encoded
-             * as a direct pointer (set during init).  We just memcpy. */
             uint8_t bytes = dtype_bitsize(e->dtype) / 8;
             if (bytes == 0) bytes = 1;
             /* The pointer is already set to the correct IOmap address */
@@ -205,22 +183,22 @@ void kron_ec_pdo_read(KRON_EC_Config *cfg) {
 void kron_ec_pdo_write(KRON_EC_Config *cfg) {
     if (!cfg) return;
     /* Output PDO data: PLC variables → IOmap (already done via var_ptr) */
-    /* Process data is sent by pdo_read on next cycle via ec_send_processdata */
+    /* Process data is sent by pdo_read on next cycle via ecx_send_processdata */
 }
 
 /* ── kron_ec_check_state ──────────────────────────────────────────────────── */
 
 void kron_ec_check_state(KRON_EC_Config *cfg) {
     if (!cfg) return;
-    if (ec_slave[0].state != EC_STATE_OPERATIONAL) {
+    if (g_ctx.slavelist[0].state != EC_STATE_OPERATIONAL) {
         /* Try to recover any slave not in OP */
-        for (int i = 1; i <= ec_slavecount; i++) {
-            if (ec_slave[i].state != EC_STATE_OPERATIONAL) {
-                fprintf(stderr, "[kronec] Slave %d lost, state=%d, recovering…\n",
-                        i, ec_slave[i].state);
-                ec_slave[i].state = EC_STATE_OPERATIONAL;
-                ec_writestate(i);
-                ec_statecheck(i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+        for (int i = 1; i <= g_ctx.slavecount; i++) {
+            if (g_ctx.slavelist[i].state != EC_STATE_OPERATIONAL) {
+                fprintf(stderr, "[kronec] Slave %d lost, state=%d, recovering...\n",
+                        i, g_ctx.slavelist[i].state);
+                g_ctx.slavelist[i].state = EC_STATE_OPERATIONAL;
+                ecx_writestate(&g_ctx, i);
+                ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
             }
         }
     }
@@ -231,9 +209,9 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
 void kron_ec_close(KRON_EC_Config *cfg) {
     (void)cfg;
     /* Request INIT state for all slaves then close */
-    ec_slave[0].state = EC_STATE_INIT;
-    ec_writestate(0);
-    ec_close();
+    g_ctx.slavelist[0].state = EC_STATE_INIT;
+    ecx_writestate(&g_ctx, 0);
+    ecx_close(&g_ctx);
     g_cfg_ptr = NULL;
     fprintf(stderr, "[kronec] EtherCAT master closed\n");
 }
