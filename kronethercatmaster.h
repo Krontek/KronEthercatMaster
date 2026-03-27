@@ -1,5 +1,5 @@
 /*
- * kronec.h  --  KronEditor EtherCAT Master runtime header
+ * kronethercatmaster.h  --  KronEditor EtherCAT Master runtime header
  *
  * Provides:
  *   - KRON_EC_Config:    Master configuration structure (port, cycle time, …)
@@ -15,8 +15,8 @@
  * return success so that the PLC code compiles and runs on the host.
  */
 
-#ifndef KRONEC_H
-#define KRONEC_H
+#ifndef KRONETHERCATMASTER_H
+#define KRONETHERCATMASTER_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -105,7 +105,7 @@ static inline void kron_ec_pdo_write(KRON_EC_Config *cfg)  { (void)cfg; }
 static inline void kron_ec_close(KRON_EC_Config *cfg)      { (void)cfg; }
 static inline void kron_ec_check_state(KRON_EC_Config *cfg){ (void)cfg; }
 #else
-/* ── Real SOEM-backed implementations (defined in kronec.c) ── */
+/* ── Real SOEM-backed implementations (defined in kronethercatmaster.c) ── */
 int  kron_ec_init(KRON_EC_Config *cfg);
 void kron_ec_pdo_read(KRON_EC_Config *cfg);
 void kron_ec_pdo_write(KRON_EC_Config *cfg);
@@ -113,4 +113,4 @@ void kron_ec_close(KRON_EC_Config *cfg);
 void kron_ec_check_state(KRON_EC_Config *cfg);  /* Call periodically to recover lost slaves */
 #endif /* KRON_EC_SIM */
 
-#endif /* KRONEC_H */
+#endif /* KRONETHERCATMASTER_H */

@@ -1,16 +1,16 @@
 /*
- * kronec.c  --  KronEditor EtherCAT Master runtime (SOEM-backed)
+ * kronethercatmaster.c  --  KronEditor EtherCAT Master runtime (SOEM-backed)
  *
  * Implements kron_ec_init / kron_ec_pdo_read / kron_ec_pdo_write / kron_ec_close
  * using the Simple Open EtherCAT Master (SOEM) library.
  *
  * Compile with: -I<soem_include_dir> and link with libsoem.a -lpthread
- * Do NOT compile when KRON_EC_SIM is defined (use the stubs in kronec.h instead).
+ * Do NOT compile when KRON_EC_SIM is defined (use the stubs in kronethercatmaster.h instead).
  */
 
 #ifndef KRON_EC_SIM
 
-#include "kronec.h"
+#include "kronethercatmaster.h"
 #include "soem/soem.h"  /* SOEM main header */
 
 #include <stdio.h>
