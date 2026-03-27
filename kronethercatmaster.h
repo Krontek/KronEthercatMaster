@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "soem/soem.h"  /* SOEM main header */
 
 /* ── PDO data types ───────────────────────────────────────────────────────── */
 typedef enum {

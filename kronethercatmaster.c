@@ -11,7 +11,6 @@
 #ifndef KRON_EC_SIM
 
 #include "kronethercatmaster.h"
-#include "soem/soem.h"  /* SOEM main header */
 
 #include <stdio.h>
 #include <string.h>
