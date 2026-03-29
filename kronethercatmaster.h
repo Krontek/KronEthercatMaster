@@ -150,13 +150,31 @@ extern KRON_EC_SDO_Queue kron_ec_sdo_queue;
 #ifdef KRON_EC_SIM
 /* ── Simulation stubs — no real hardware accessed ── */
 static inline int  kron_ec_init(KRON_EC_Config *cfg) {
-    if (cfg) { cfg->master_state = KRON_EC_MASTER_OP; cfg->is_operational = true; cfg->found_slaves = 0; }
+    if (!cfg) return KRON_EC_ERR_INIT;
+    cfg->master_state   = KRON_EC_MASTER_OP;
+    cfg->is_operational = true;
+    /* In simulation, pretend all configured slaves are present and in OP */
+    cfg->found_slaves   = cfg->slave_count;
+    for (int _i = 0; _i < cfg->slave_count; _i++) {
+        cfg->slaves[_i].current_state = 0x08; /* EC_STATE_OPERATIONAL */
+        cfg->slaves[_i].link_up       = true;
+    }
     return KRON_EC_OK;
 }
 static inline void kron_ec_pdo_read(KRON_EC_Config *cfg)    { (void)cfg; }
 static inline void kron_ec_pdo_write(KRON_EC_Config *cfg)   { (void)cfg; }
-static inline void kron_ec_close(KRON_EC_Config *cfg)       { if (cfg) { cfg->master_state = KRON_EC_MASTER_NONE; cfg->is_operational = false; } }
-static inline void kron_ec_check_state(KRON_EC_Config *cfg) { (void)cfg; }
+static inline void kron_ec_close(KRON_EC_Config *cfg)       { if (cfg) { cfg->master_state = KRON_EC_MASTER_NONE; cfg->is_operational = false; cfg->found_slaves = 0; } }
+static inline void kron_ec_check_state(KRON_EC_Config *cfg) {
+    /* In simulation keep all slaves alive */
+    if (!cfg) return;
+    cfg->master_state   = KRON_EC_MASTER_OP;
+    cfg->is_operational = true;
+    cfg->found_slaves   = cfg->slave_count;
+    for (int _i = 0; _i < cfg->slave_count; _i++) {
+        cfg->slaves[_i].current_state = 0x08;
+        cfg->slaves[_i].link_up       = true;
+    }
+}
 static inline void kron_ec_process_sdo(KRON_EC_Config *cfg) {
     (void)cfg;
     /* In sim: immediately complete any pending SDO request */
@@ -205,8 +223,6 @@ typedef struct {
     bool     _prevEnable;
 } EC_GetMasterState;
 
-void EC_GetMasterState_Call(EC_GetMasterState *inst, KRON_EC_Config *cfg);
-
 /* ── EC_GetSlaveState ─────────────────────────────────────────────────────── */
 typedef struct {
     /* VAR_INPUT */
@@ -222,8 +238,6 @@ typedef struct {
     bool     _prevEnable;
 } EC_GetSlaveState;
 
-void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg);
-
 /* ── EC_ResetBus ──────────────────────────────────────────────────────────── */
 typedef struct {
     /* VAR_INPUT */
@@ -236,8 +250,6 @@ typedef struct {
     /* Internal */
     bool     _prevExecute;
 } EC_ResetBus;
-
-void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg);
 
 /* ── EC_ReadSDO ───────────────────────────────────────────────────────────── */
 typedef struct {
@@ -257,8 +269,6 @@ typedef struct {
     bool     _prevExecute;
 } EC_ReadSDO;
 
-void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg);
-
 /* ── EC_WriteSDO ──────────────────────────────────────────────────────────── */
 typedef struct {
     /* VAR_INPUT */
@@ -277,6 +287,60 @@ typedef struct {
     bool     _prevExecute;
 } EC_WriteSDO;
 
+/* ── EC FB Call function declarations / inline stubs ─────────────────────── */
+/* Real mode: implemented in kronethercatmaster.c and linked via .a           */
+/* Sim mode:  inline stubs — library is not linked, no external symbol needed */
+#ifndef KRON_EC_SIM
+
+void EC_GetMasterState_Call(EC_GetMasterState *inst, KRON_EC_Config *cfg);
+void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg);
+void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg);
+void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg);
 void EC_WriteSDO_Call(EC_WriteSDO *inst, KRON_EC_Config *cfg);
+
+#else /* KRON_EC_SIM */
+
+static inline void EC_GetMasterState_Call(EC_GetMasterState *inst, KRON_EC_Config *cfg) {
+    if (!inst->Enable) { inst->Valid = false; return; }
+    inst->Valid       = true;
+    inst->Error       = false;
+    inst->ErrorID     = 0;
+    inst->State       = cfg ? (uint8_t)cfg->master_state : (uint8_t)KRON_EC_MASTER_OP;
+    inst->Operational = cfg ? cfg->is_operational : true;
+    inst->SlaveCount  = cfg ? (uint16_t)cfg->found_slaves : 0;
+}
+
+static inline void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg) {
+    if (!inst->Enable) { inst->Valid = false; return; }
+    inst->Valid   = true;
+    inst->Error   = false;
+    inst->ErrorID = 0;
+    inst->State   = 0x08; /* EC_STATE_OPERATIONAL */
+    inst->LinkUp  = true;
+    (void)cfg;
+}
+
+static inline void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
+    bool rising = inst->Execute && !inst->_prevExecute;
+    inst->_prevExecute = inst->Execute;
+    if (rising) { inst->Done = true; inst->Busy = false; inst->Error = false; inst->ErrorID = 0; }
+    (void)cfg;
+}
+
+static inline void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
+    bool rising = inst->Execute && !inst->_prevExecute;
+    inst->_prevExecute = inst->Execute;
+    if (rising) { inst->Done = true; inst->Busy = false; inst->Error = false; inst->ErrorID = 0; inst->Value = 0; }
+    (void)cfg;
+}
+
+static inline void EC_WriteSDO_Call(EC_WriteSDO *inst, KRON_EC_Config *cfg) {
+    bool rising = inst->Execute && !inst->_prevExecute;
+    inst->_prevExecute = inst->Execute;
+    if (rising) { inst->Done = true; inst->Busy = false; inst->Error = false; inst->ErrorID = 0; }
+    (void)cfg;
+}
+
+#endif /* KRON_EC_SIM */
 
 #endif /* KRONETHERCATMASTER_H */

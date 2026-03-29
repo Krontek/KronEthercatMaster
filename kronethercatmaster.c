@@ -245,15 +245,21 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
     cfg->is_operational = all_op;
     cfg->master_state   = all_op ? KRON_EC_MASTER_OP : KRON_EC_MASTER_ERROR;
 
-    /* Update per-slave runtime state */
+    /* Update per-slave runtime state and count currently-active slaves */
+    int active = 0;
     for (int si = 0; si < cfg->slave_count; si++) {
         KRON_EC_Slave *sl = &cfg->slaves[si];
         uint16_t pos = sl->position;
         if (pos >= 1 && pos <= (uint16_t)g_ctx.slavecount) {
             sl->current_state = (uint8_t)g_ctx.slavelist[pos].state;
             sl->link_up       = (sl->current_state == EC_STATE_OPERATIONAL);
+            if (sl->link_up) active++;
+        } else {
+            sl->current_state = 0;
+            sl->link_up       = false;
         }
     }
+    cfg->found_slaves = active;
 }
 
 /* ── kron_ec_process_sdo ──────────────────────────────────────────────────── */
