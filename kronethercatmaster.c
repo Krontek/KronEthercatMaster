@@ -386,19 +386,33 @@ void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
 
         if (!cfg) { inst->Error = true; inst->ErrorID = 0x8001; inst->Busy = false; }
         else {
-            /* Request OP state for all slaves */
-            g_ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
-            ecx_writestate(&g_ctx, 0);
-            ecx_statecheck(&g_ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+            /* Per-slave recovery: recover link + reconfig PDOs + request OP.
+             * slavelist[0] is the master — slaves start at index 1. */
+            for (int i = 1; i <= g_ctx.slavecount; i++) {
+                uint16_t actual = ecx_statecheck(&g_ctx, i,
+                                                 EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
+                if (actual != EC_STATE_OPERATIONAL) {
+                    fprintf(stderr, "[kronec] ResetBus: slave %d not OP (0x%02X), recovering\n",
+                            i, actual);
+                    if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTSAFE)) {
+                        ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTSAFE);
+                        g_ctx.slavelist[i].islost = FALSE;
+                        ecx_statecheck(&g_ctx, i, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
+                    }
+                    g_ctx.slavelist[i].state = EC_STATE_OPERATIONAL;
+                    ecx_writestate(&g_ctx, i);
+                    actual = ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+                    g_ctx.slavelist[i].state = actual;
+                }
+            }
 
-            bool all_op = (g_ctx.slavelist[0].state == EC_STATE_OPERATIONAL);
-            cfg->is_operational = all_op;
-            cfg->master_state   = all_op ? KRON_EC_MASTER_OP : KRON_EC_MASTER_ERROR;
+            /* Re-use check_state logic to update cfg slave status & overall state */
+            kron_ec_check_state(cfg);
 
             inst->Busy  = false;
-            inst->Done  = all_op;
-            inst->Error = !all_op;
-            if (!all_op) inst->ErrorID = 0x8002; /* Could not reach OP */
+            inst->Done  = cfg->is_operational;
+            inst->Error = !cfg->is_operational;
+            if (!cfg->is_operational) inst->ErrorID = 0x8002; /* One or more slaves not OP */
         }
     }
     inst->_prevExecute = inst->Execute;
