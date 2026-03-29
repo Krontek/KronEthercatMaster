@@ -232,13 +232,35 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
     bool all_op = true;
     for (int i = 1; i <= g_ctx.slavecount; i++) {
         ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
+
         if (g_ctx.slavelist[i].state != EC_STATE_OPERATIONAL) {
             all_op = false;
-            fprintf(stderr, "[kronec] Slave %d lost (state=0x%02X), recovering\n",
+            fprintf(stderr, "[kronec] Slave %d not OP (state=0x%02X), recovering\n",
                     i, g_ctx.slavelist[i].state);
+
+            /* Full SOEM recovery sequence for reconnected/reset slave:
+             * 1. ecx_recover_slave  — re-establishes link layer
+             * 2. ecx_reconfig_slave — re-applies PDO mapping & SDO inits
+             * 3. Bring to SAFE-OP first, then OP                          */
+            if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTMON)) {
+                ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTMON);
+                g_ctx.slavelist[i].islost = FALSE;
+
+                /* Step through state machine: SAFE-OP first */
+                ecx_statecheck(&g_ctx, i, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
+            }
+
+            /* Request OP */
             g_ctx.slavelist[i].state = EC_STATE_OPERATIONAL;
             ecx_writestate(&g_ctx, i);
             ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+
+            if (g_ctx.slavelist[i].state == EC_STATE_OPERATIONAL) {
+                fprintf(stderr, "[kronec] Slave %d recovered to OP\n", i);
+            } else {
+                fprintf(stderr, "[kronec] Slave %d recovery failed (state=0x%02X)\n",
+                        i, g_ctx.slavelist[i].state);
+            }
         }
     }
 
