@@ -373,6 +373,26 @@ void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg) {
 }
 
 /* ── EC_ResetBus ──────────────────────────────────────────────────────────── */
+/*
+ * Full re-initialization via kron_ec_init().
+ *
+ * Incremental recovery (ecx_recover_slave + ecx_reconfig_slave) is only
+ * sufficient when a slave briefly glitches.  After a deliberate power
+ * cycle the slave boots from scratch (INIT state, no IOmap), so the
+ * master must also rebuild its context from scratch.
+ *
+ * kron_ec_init() sets cfg->is_operational = false before touching SOEM,
+ * which causes the IO_Bus thread to skip kron_ec_pdo_read/write during
+ * the brief reinit window — no mutex needed.
+ *
+ * ErrorID mapping on failure:
+ *   0x8001 — null cfg pointer
+ *   0x8011 — ecx_init failed (NIC/driver error)
+ *   0x8012 — no slaves found on bus
+ *   0x8013 — PDO/IOmap config error
+ *   0x8014 — could not reach OP state
+ *   0x8002 — init returned OK but bus still not fully operational
+ */
 void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
     bool rising = inst->Execute && !inst->_prevExecute;
 
@@ -384,35 +404,26 @@ void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
         inst->Error   = false;
         inst->ErrorID = 0;
 
-        if (!cfg) { inst->Error = true; inst->ErrorID = 0x8001; inst->Busy = false; }
-        else {
-            /* Per-slave recovery: recover link + reconfig PDOs + request OP.
-             * slavelist[0] is the master — slaves start at index 1. */
-            for (int i = 1; i <= g_ctx.slavecount; i++) {
-                uint16_t actual = ecx_statecheck(&g_ctx, i,
-                                                 EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
-                if (actual != EC_STATE_OPERATIONAL) {
-                    fprintf(stderr, "[kronec] ResetBus: slave %d not OP (0x%02X), recovering\n",
-                            i, actual);
-                    if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTSAFE)) {
-                        ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTSAFE);
-                        g_ctx.slavelist[i].islost = FALSE;
-                        ecx_statecheck(&g_ctx, i, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
-                    }
-                    g_ctx.slavelist[i].state = EC_STATE_OPERATIONAL;
-                    ecx_writestate(&g_ctx, i);
-                    actual = ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
-                    g_ctx.slavelist[i].state = actual;
+        if (!cfg) {
+            inst->Error   = true;
+            inst->ErrorID = 0x8001;
+            inst->Busy    = false;
+        } else {
+            int rc = kron_ec_init(cfg);
+
+            inst->Busy = false;
+            if (rc == KRON_EC_OK && cfg->is_operational) {
+                inst->Done = true;
+            } else {
+                inst->Error = true;
+                switch (rc) {
+                    case KRON_EC_ERR_INIT:      inst->ErrorID = 0x8011; break;
+                    case KRON_EC_ERR_NO_SLAVES:  inst->ErrorID = 0x8012; break;
+                    case KRON_EC_ERR_CONFIG:     inst->ErrorID = 0x8013; break;
+                    case KRON_EC_ERR_OP:         inst->ErrorID = 0x8014; break;
+                    default:                     inst->ErrorID = 0x8002; break;
                 }
             }
-
-            /* Re-use check_state logic to update cfg slave status & overall state */
-            kron_ec_check_state(cfg);
-
-            inst->Busy  = false;
-            inst->Done  = cfg->is_operational;
-            inst->Error = !cfg->is_operational;
-            if (!cfg->is_operational) inst->ErrorID = 0x8002; /* One or more slaves not OP */
         }
     }
     inst->_prevExecute = inst->Execute;
