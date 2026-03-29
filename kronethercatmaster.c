@@ -242,8 +242,8 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
              * 1. ecx_recover_slave  — re-establishes link layer
              * 2. ecx_reconfig_slave — re-applies PDO mapping & SDO inits
              * 3. Bring to SAFE-OP first, then OP                          */
-            if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTMON)) {
-                ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTMON);
+            if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTSAFE)) {
+                ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTSAFE);
                 g_ctx.slavelist[i].islost = FALSE;
 
                 /* Step through state machine: SAFE-OP first */
