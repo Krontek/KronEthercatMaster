@@ -229,59 +229,55 @@ void kron_ec_pdo_write(KRON_EC_Config *cfg) {
 void kron_ec_check_state(KRON_EC_Config *cfg) {
     if (!cfg) return;
 
-    bool all_op = true;
     for (int i = 1; i <= g_ctx.slavecount; i++) {
-        ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
+        /* Read actual state from slave — return value is authoritative */
+        uint16_t actual = ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
 
-        if (g_ctx.slavelist[i].state != EC_STATE_OPERATIONAL) {
-            all_op = false;
+        if (actual != EC_STATE_OPERATIONAL) {
             fprintf(stderr, "[kronec] Slave %d not OP (state=0x%02X), recovering\n",
-                    i, g_ctx.slavelist[i].state);
+                    i, actual);
 
-            /* Full SOEM recovery sequence for reconnected/reset slave:
-             * 1. ecx_recover_slave  — re-establishes link layer
-             * 2. ecx_reconfig_slave — re-applies PDO mapping & SDO inits
-             * 3. Bring to SAFE-OP first, then OP                          */
+            /* Slave reset / reconnected: recover link + reconfig PDOs */
             if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTSAFE)) {
                 ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTSAFE);
                 g_ctx.slavelist[i].islost = FALSE;
-
-                /* Step through state machine: SAFE-OP first */
                 ecx_statecheck(&g_ctx, i, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
             }
 
-            /* Request OP */
+            /* Request OP — set desired state then write */
             g_ctx.slavelist[i].state = EC_STATE_OPERATIONAL;
             ecx_writestate(&g_ctx, i);
-            ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+            /* Read back actual state: return value tells us if it worked */
+            actual = ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+            /* Sync slavelist so counting loop below uses real state */
+            g_ctx.slavelist[i].state = actual;
 
-            if (g_ctx.slavelist[i].state == EC_STATE_OPERATIONAL) {
+            if (actual == EC_STATE_OPERATIONAL)
                 fprintf(stderr, "[kronec] Slave %d recovered to OP\n", i);
-            } else {
-                fprintf(stderr, "[kronec] Slave %d recovery failed (state=0x%02X)\n",
-                        i, g_ctx.slavelist[i].state);
-            }
+            else
+                fprintf(stderr, "[kronec] Slave %d recovery failed (state=0x%02X)\n", i, actual);
         }
     }
 
-    cfg->is_operational = all_op;
-    cfg->master_state   = all_op ? KRON_EC_MASTER_OP : KRON_EC_MASTER_ERROR;
-
-    /* Update per-slave runtime state and count currently-active slaves */
-    int active = 0;
+    /* Count active slaves and update per-slave status */
+    int active  = 0;
+    bool all_op = true;
     for (int si = 0; si < cfg->slave_count; si++) {
-        KRON_EC_Slave *sl = &cfg->slaves[si];
-        uint16_t pos = sl->position;
+        KRON_EC_Slave *sl  = &cfg->slaves[si];
+        uint16_t       pos = sl->position;
         if (pos >= 1 && pos <= (uint16_t)g_ctx.slavecount) {
             sl->current_state = (uint8_t)g_ctx.slavelist[pos].state;
             sl->link_up       = (sl->current_state == EC_STATE_OPERATIONAL);
-            if (sl->link_up) active++;
+            if (sl->link_up) active++; else all_op = false;
         } else {
             sl->current_state = 0;
             sl->link_up       = false;
+            all_op            = false;
         }
     }
-    cfg->found_slaves = active;
+    cfg->found_slaves   = active;
+    cfg->is_operational = all_op;
+    cfg->master_state   = all_op ? KRON_EC_MASTER_OP : KRON_EC_MASTER_ERROR;
 }
 
 /* ── kron_ec_process_sdo ──────────────────────────────────────────────────── */
