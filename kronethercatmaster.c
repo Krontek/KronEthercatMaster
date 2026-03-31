@@ -89,16 +89,10 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     fprintf(stderr, "[kronec] Found %d slave(s)\n", found);
     cfg->master_state = KRON_EC_MASTER_PREOP;
 
-    /* Clear PDO assignments so SOEM uses default mapping */
-    for (int si = 0; si < cfg->slave_count; si++) {
-        uint16_t pos = cfg->slaves[si].position;
-        if (pos < 1 || pos > (uint16_t)g_ctx.slavecount) continue;
-        uint8_t zero = 0;
-        ecx_SDOwrite(&g_ctx, pos, 0x1C12, 0x00, FALSE, 1, &zero, EC_TIMEOUTRXM);
-        ecx_SDOwrite(&g_ctx, pos, 0x1C13, 0x00, FALSE, 1, &zero, EC_TIMEOUTRXM);
-    }
-
-    /* Map all slaves to IOmap */
+    /* Map all slaves to IOmap using drive's existing PDO assignment.
+     * Do NOT clear 0x1C12/0x1C13 — writing count=0 removes all PDO
+     * assignments, causing ecx_config_map_group to see 0 input/output
+     * bytes and leaving slavelist[pos].inputs empty (all-zero reads). */
     ecx_config_map_group(&g_ctx, g_IOmap, 0);
 
     /* Distributed clocks */
