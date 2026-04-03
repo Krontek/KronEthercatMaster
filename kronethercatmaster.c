@@ -89,8 +89,8 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     fprintf(stderr, "[kronec] Found %d slave(s)\n", found);
     cfg->master_state = KRON_EC_MASTER_PREOP;
 
-    /* Apply PDO mapping SDOs (0x1600/0x1A00/0x1C12/0x1C13) in PREOP so that
-     * ecx_config_map_group sees the correct layout and builds the IOmap accordingly. */
+    /* Apply all init SDOs in PREOP so ecx_config_map_group sees the final PDO layout
+     * and builds the IOmap with the correct byte offsets. */
     for (int si = 0; si < cfg->slave_count; si++) {
         KRON_EC_Slave *sl = &cfg->slaves[si];
         uint16_t pos = sl->position;
@@ -130,18 +130,6 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     }
     cfg->master_state   = KRON_EC_MASTER_OP;
     cfg->is_operational = true;
-
-    /* Write startup SDO init commands (CoE) */
-    for (int si = 0; si < cfg->slave_count; si++) {
-        KRON_EC_Slave *sl = &cfg->slaves[si];
-        uint16_t pos = sl->position;
-        for (int i = 0; i < sl->sdo_count; i++) {
-            KRON_EC_SDO *s = &sl->sdo_inits[i];
-            if (do_sdo_write(pos, s->index, s->subindex, s->byte_size, s->value) != KRON_EC_OK)
-                fprintf(stderr, "[kronec] SDO init failed: slave %d 0x%04X:%02X\n",
-                        pos, s->index, s->subindex);
-        }
-    }
 
     /* Update per-slave runtime state */
     for (int si = 0; si < cfg->slave_count; si++) {
