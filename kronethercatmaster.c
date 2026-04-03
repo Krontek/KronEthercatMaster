@@ -89,10 +89,19 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     fprintf(stderr, "[kronec] Found %d slave(s)\n", found);
     cfg->master_state = KRON_EC_MASTER_PREOP;
 
-    /* Map all slaves to IOmap using drive's existing PDO assignment.
-     * Do NOT clear 0x1C12/0x1C13 — writing count=0 removes all PDO
-     * assignments, causing ecx_config_map_group to see 0 input/output
-     * bytes and leaving slavelist[pos].inputs empty (all-zero reads). */
+    /* Apply PDO mapping SDOs (0x1600/0x1A00/0x1C12/0x1C13) in PREOP so that
+     * ecx_config_map_group sees the correct layout and builds the IOmap accordingly. */
+    for (int si = 0; si < cfg->slave_count; si++) {
+        KRON_EC_Slave *sl = &cfg->slaves[si];
+        uint16_t pos = sl->position;
+        for (int i = 0; i < sl->sdo_count; i++) {
+            KRON_EC_SDO *s = &sl->sdo_inits[i];
+            if (do_sdo_write(pos, s->index, s->subindex, s->byte_size, s->value) != KRON_EC_OK)
+                fprintf(stderr, "[kronec] PDO SDO failed: slave %d 0x%04X:%02X\n",
+                        pos, s->index, s->subindex);
+        }
+    }
+
     ecx_config_map_group(&g_ctx, g_IOmap, 0);
 
     /* Distributed clocks */
