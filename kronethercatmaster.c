@@ -21,6 +21,7 @@
 /* ── SOEM v2 context ─────────────────────────────────────────────────────── */
 static ecx_contextt  g_ctx;
 static char          g_IOmap[4096];
+static KRON_EC_Config *g_cfg_ptr = NULL;
 
 /* ── Global SDO queue (single-slot, lock-free via volatile state) ─────────── */
 KRON_EC_SDO_Queue kron_ec_sdo_queue = { KRON_EC_SDO_IDLE, 0, 0, 0, 0, 0 };
@@ -60,6 +61,24 @@ static int do_sdo_read(uint16_t slave, uint16_t idx, uint8_t sub,
     return KRON_EC_ERR_IO;
 }
 
+/* ── PO2SO hook — called by SOEM for each slave during PREOP→SAFEOP ─────── */
+
+static int kron_po2so_hook(uint16 slave) {
+    if (!g_cfg_ptr) return 1;
+    for (int si = 0; si < g_cfg_ptr->slave_count; si++) {
+        KRON_EC_Slave *sl = &g_cfg_ptr->slaves[si];
+        if (sl->position != slave) continue;
+        for (int i = 0; i < sl->sdo_count; i++) {
+            KRON_EC_SDO *s = &sl->sdo_inits[i];
+            if (do_sdo_write(slave, s->index, s->subindex, s->byte_size, s->value) != KRON_EC_OK)
+                fprintf(stderr, "[kronec] PO2SO SDO failed: slave %d 0x%04X:%02X\n",
+                        slave, s->index, s->subindex);
+        }
+        break;
+    }
+    return 1;
+}
+
 /* ── kron_ec_init ─────────────────────────────────────────────────────────── */
 
 int kron_ec_init(KRON_EC_Config *cfg) {
@@ -89,17 +108,11 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     fprintf(stderr, "[kronec] Found %d slave(s)\n", found);
     cfg->master_state = KRON_EC_MASTER_PREOP;
 
-    /* Apply all init SDOs in PREOP so ecx_config_map_group sees the final PDO layout
-     * and builds the IOmap with the correct byte offsets. */
-    for (int si = 0; si < cfg->slave_count; si++) {
-        KRON_EC_Slave *sl = &cfg->slaves[si];
-        uint16_t pos = sl->position;
-        for (int i = 0; i < sl->sdo_count; i++) {
-            KRON_EC_SDO *s = &sl->sdo_inits[i];
-            if (do_sdo_write(pos, s->index, s->subindex, s->byte_size, s->value) != KRON_EC_OK)
-                fprintf(stderr, "[kronec] PDO SDO failed: slave %d 0x%04X:%02X\n",
-                        pos, s->index, s->subindex);
-        }
+    /* Register PO2SO hook on all slaves so SDO inits run during PREOP→SAFEOP
+     * transition — exactly when SOEM expects PDO remapping SDOs to be applied. */
+    g_cfg_ptr = cfg;
+    for (int i = 1; i <= g_ctx.slavecount; i++) {
+        g_ctx.slavelist[i].PO2SOconfig = kron_po2so_hook;
     }
 
     ecx_config_map_group(&g_ctx, g_IOmap, 0);
