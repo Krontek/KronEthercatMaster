@@ -23,6 +23,11 @@ static ecx_contextt  g_ctx;
 static char          g_IOmap[4096];
 static KRON_EC_Config *g_cfg_ptr = NULL;
 
+/* ── EtherCAT context mutex ──────────────────────────────────────────────── */
+/* SOEM is NOT thread-safe: ecx_SDOread/write and ecx_send/receive_processdata
+ * share the same socket. This mutex serializes SDO and PDO access. */
+static pthread_mutex_t g_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ── Global SDO queue (single-slot, lock-free via volatile state) ─────────── */
 KRON_EC_SDO_Queue kron_ec_sdo_queue = { KRON_EC_SDO_IDLE, 0, 0, 0, 0, 0 };
 
@@ -47,8 +52,10 @@ static uint8_t dtype_bytes(KRON_EC_DataType dt) {
 
 static int do_sdo_write(uint16_t slave, uint16_t idx, uint8_t sub,
                         uint8_t bsz, uint32_t val) {
+    pthread_mutex_lock(&g_ctx_mutex);
     int wkc = ecx_SDOwrite(&g_ctx, slave, idx, sub, FALSE,
                            bsz, &val, EC_TIMEOUTRXM);
+    pthread_mutex_unlock(&g_ctx_mutex);
     return (wkc > 0) ? KRON_EC_OK : KRON_EC_ERR_IO;
 }
 
@@ -56,7 +63,9 @@ static int do_sdo_read(uint16_t slave, uint16_t idx, uint8_t sub,
                        uint8_t bsz, uint32_t *out) {
     int sz = (int)bsz;
     uint32_t buf = 0;
+    pthread_mutex_lock(&g_ctx_mutex);
     int wkc = ecx_SDOread(&g_ctx, slave, idx, sub, FALSE, &sz, &buf, EC_TIMEOUTRXM);
+    pthread_mutex_unlock(&g_ctx_mutex);
     if (wkc > 0) { *out = buf; return KRON_EC_OK; }
     return KRON_EC_ERR_IO;
 }
@@ -168,8 +177,10 @@ int kron_ec_init(KRON_EC_Config *cfg) {
 void kron_ec_pdo_read(KRON_EC_Config *cfg) {
     if (!cfg || !cfg->is_operational) return;
 
+    pthread_mutex_lock(&g_ctx_mutex);
     ecx_send_processdata(&g_ctx);
     ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
+    pthread_mutex_unlock(&g_ctx_mutex);
 
     /* Copy TxPDO (inputs) from IOmap → PLC variable pointers */
     for (int si = 0; si < cfg->slave_count; si++) {
@@ -234,27 +245,23 @@ void kron_ec_pdo_write(KRON_EC_Config *cfg) {
 void kron_ec_check_state(KRON_EC_Config *cfg) {
     if (!cfg) return;
 
+    pthread_mutex_lock(&g_ctx_mutex);
     for (int i = 1; i <= g_ctx.slavecount; i++) {
-        /* Read actual state from slave — return value is authoritative */
         uint16_t actual = ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
 
         if (actual != EC_STATE_OPERATIONAL) {
             fprintf(stderr, "[kronec] Slave %d not OP (state=0x%02X), recovering\n",
                     i, actual);
 
-            /* Slave reset / reconnected: recover link + reconfig PDOs */
             if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTSAFE)) {
                 ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTSAFE);
                 g_ctx.slavelist[i].islost = FALSE;
                 ecx_statecheck(&g_ctx, i, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
             }
 
-            /* Request OP — set desired state then write */
             g_ctx.slavelist[i].state = EC_STATE_OPERATIONAL;
             ecx_writestate(&g_ctx, i);
-            /* Read back actual state: return value tells us if it worked */
             actual = ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
-            /* Sync slavelist so counting loop below uses real state */
             g_ctx.slavelist[i].state = actual;
 
             if (actual == EC_STATE_OPERATIONAL)
@@ -263,6 +270,7 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
                 fprintf(stderr, "[kronec] Slave %d recovery failed (state=0x%02X)\n", i, actual);
         }
     }
+    pthread_mutex_unlock(&g_ctx_mutex);
 
     /* Count active slaves and update per-slave status */
     int active  = 0;
