@@ -28,8 +28,9 @@ static KRON_EC_Config *g_cfg_ptr = NULL;
  * share the same socket. This mutex serializes SDO and PDO access. */
 static pthread_mutex_t g_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* ── Global SDO queue (single-slot, lock-free via volatile state) ─────────── */
-KRON_EC_SDO_Queue kron_ec_sdo_queue = { KRON_EC_SDO_IDLE, 0, 0, 0, 0, 0 };
+/* ── Global SDO queue ─────────────────────────────────────────────────────── */
+static KRON_EC_SDO_Request sdo_queue[KRON_EC_MAX_SDO_QUEUE_SIZE];
+static pthread_mutex_t sdo_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ── helpers ──────────────────────────────────────────────────────────────── */
 
@@ -70,9 +71,23 @@ static int do_sdo_read(uint16_t slave, uint16_t idx, uint8_t sub,
     return KRON_EC_ERR_IO;
 }
 
+static void kron_ec_init_sdo_queue(void) {
+    pthread_mutex_lock(&sdo_queue_mutex);
+    for (int i = 0; i < KRON_EC_MAX_SDO_QUEUE_SIZE; i++) {
+        sdo_queue[i].state     = KRON_EC_SDO_IDLE;
+        sdo_queue[i].slave_pos = 0;
+        sdo_queue[i].index     = 0;
+        sdo_queue[i].subindex  = 0;
+        sdo_queue[i].byte_size = 0;
+        sdo_queue[i].value     = 0;
+    }
+    pthread_mutex_unlock(&sdo_queue_mutex);
+}
+
 /* ── PO2SO hook — called by SOEM for each slave during PREOP→SAFEOP ─────── */
 
-static int kron_po2so_hook(uint16 slave) {
+static int kron_po2so_hook(ecx_contextt *ctx, uint16 slave) {
+    (void)ctx;
     if (!g_cfg_ptr) return 1;
     for (int si = 0; si < g_cfg_ptr->slave_count; si++) {
         KRON_EC_Slave *sl = &g_cfg_ptr->slaves[si];
@@ -92,6 +107,8 @@ static int kron_po2so_hook(uint16 slave) {
 
 int kron_ec_init(KRON_EC_Config *cfg) {
     if (!cfg || cfg->ifname[0] == '\0') return KRON_EC_ERR_INIT;
+
+    kron_ec_init_sdo_queue();
 
     cfg->master_state   = KRON_EC_MASTER_NONE;
     cfg->is_operational = false;
@@ -296,33 +313,39 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
 /* ── kron_ec_process_sdo ──────────────────────────────────────────────────── */
 /*
  * Called from the SDO background thread (NOT the RT cycle thread).
- * Processes one pending request from the single-slot async SDO queue.
+ * Processes one pending request from the async SDO queue.
  * This keeps SDO traffic completely off the real-time PDO path.
  */
 void kron_ec_process_sdo(KRON_EC_Config *cfg) {
     (void)cfg;
-    int st = kron_ec_sdo_queue.state;
+    for (int i = 0; i < KRON_EC_MAX_SDO_QUEUE_SIZE; i++) {
+        int st = sdo_queue[i].state;
 
-    if (st == KRON_EC_SDO_WRITE_REQ) {
-        int r = do_sdo_write(kron_ec_sdo_queue.slave_pos,
-                             kron_ec_sdo_queue.index,
-                             kron_ec_sdo_queue.subindex,
-                             kron_ec_sdo_queue.byte_size,
-                             kron_ec_sdo_queue.value);
-        kron_ec_sdo_queue.state = (r == KRON_EC_OK) ? KRON_EC_SDO_DONE_OK
-                                                     : KRON_EC_SDO_DONE_ERR;
-    } else if (st == KRON_EC_SDO_READ_REQ) {
-        uint32_t val = 0;
-        int r = do_sdo_read(kron_ec_sdo_queue.slave_pos,
-                            kron_ec_sdo_queue.index,
-                            kron_ec_sdo_queue.subindex,
-                            kron_ec_sdo_queue.byte_size,
-                            &val);
-        if (r == KRON_EC_OK) {
-            kron_ec_sdo_queue.value = val;
-            kron_ec_sdo_queue.state = KRON_EC_SDO_DONE_OK;
-        } else {
-            kron_ec_sdo_queue.state = KRON_EC_SDO_DONE_ERR;
+        if (st == KRON_EC_SDO_WRITE_REQ) {
+            int r = do_sdo_write(sdo_queue[i].slave_pos,
+                                 sdo_queue[i].index,
+                                 sdo_queue[i].subindex,
+                                 sdo_queue[i].byte_size,
+                                 sdo_queue[i].value);
+            sdo_queue[i].state = (r == KRON_EC_OK) ? KRON_EC_SDO_DONE_OK
+                                                   : KRON_EC_SDO_DONE_ERR;
+            break;
+        }
+
+        if (st == KRON_EC_SDO_READ_REQ) {
+            uint32_t val = 0;
+            int r = do_sdo_read(sdo_queue[i].slave_pos,
+                                sdo_queue[i].index,
+                                sdo_queue[i].subindex,
+                                sdo_queue[i].byte_size,
+                                &val);
+            if (r == KRON_EC_OK) {
+                sdo_queue[i].value = val;
+                sdo_queue[i].state = KRON_EC_SDO_DONE_OK;
+            } else {
+                sdo_queue[i].state = KRON_EC_SDO_DONE_ERR;
+            }
+            break;
         }
     }
 }
@@ -447,7 +470,6 @@ void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
  * Non-blocking: posts a request to the global SDO queue on rising edge of
  * Execute, then polls state each cycle. Done/Error/Value set when the
  * SDO background thread completes the transfer.
- * Only one SDO operation can be in-flight at a time.
  */
 void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
     (void)cfg;
@@ -455,7 +477,6 @@ void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
 
     if (!inst->Execute && inst->_prevExecute) {
         inst->Done  = false;
-        inst->Busy  = false;
         inst->Value = 0;
     }
 
@@ -465,35 +486,48 @@ void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
         inst->Error   = false;
         inst->ErrorID = 0;
         inst->Value   = 0;
+        inst->_queue_id = -1;
 
-        if (kron_ec_sdo_queue.state != KRON_EC_SDO_IDLE) {
-            /* Queue busy — another SDO in-flight */
+        pthread_mutex_lock(&sdo_queue_mutex);
+        for (int i = 0; i < KRON_EC_MAX_SDO_QUEUE_SIZE; i++) {
+            if (sdo_queue[i].state != KRON_EC_SDO_IDLE) continue;
+
+            sdo_queue[i].slave_pos = inst->SlaveAddress;
+            sdo_queue[i].index     = inst->Index;
+            sdo_queue[i].subindex  = inst->SubIndex;
+            sdo_queue[i].byte_size = inst->ByteSize ? inst->ByteSize : 4;
+            sdo_queue[i].value     = 0;
+            sdo_queue[i].state     = KRON_EC_SDO_READ_REQ;
+            inst->_queue_id        = i;
+            break;
+        }
+        pthread_mutex_unlock(&sdo_queue_mutex);
+
+        if (inst->_queue_id < 0) {
             inst->Error   = true;
             inst->ErrorID = 0x8020;
             inst->Busy    = false;
-        } else {
-            kron_ec_sdo_queue.slave_pos = inst->SlaveAddress;
-            kron_ec_sdo_queue.index     = inst->Index;
-            kron_ec_sdo_queue.subindex  = inst->SubIndex;
-            kron_ec_sdo_queue.byte_size = inst->ByteSize ? inst->ByteSize : 4;
-            kron_ec_sdo_queue.value     = 0;
-            kron_ec_sdo_queue.state     = KRON_EC_SDO_READ_REQ; /* post to queue */
         }
     }
 
     /* Poll queue state */
-    if (inst->Busy) {
-        int st = kron_ec_sdo_queue.state;
+    if (inst->Busy && inst->_queue_id >= 0 &&
+        inst->_queue_id < KRON_EC_MAX_SDO_QUEUE_SIZE) {
+        KRON_EC_SDO_Request *req = &sdo_queue[inst->_queue_id];
+        int st = req->state;
+
         if (st == KRON_EC_SDO_DONE_OK) {
-            inst->Value             = kron_ec_sdo_queue.value;
-            inst->Done              = true;
-            inst->Busy              = false;
-            kron_ec_sdo_queue.state = KRON_EC_SDO_IDLE;
+            inst->Value      = req->value;
+            inst->Done       = true;
+            inst->Busy       = false;
+            req->state       = KRON_EC_SDO_IDLE;
+            inst->_queue_id  = -1;
         } else if (st == KRON_EC_SDO_DONE_ERR) {
-            inst->Error             = true;
-            inst->ErrorID           = 0x8021;
-            inst->Busy              = false;
-            kron_ec_sdo_queue.state = KRON_EC_SDO_IDLE;
+            inst->Error      = true;
+            inst->ErrorID    = 0x8021;
+            inst->Busy       = false;
+            req->state       = KRON_EC_SDO_IDLE;
+            inst->_queue_id  = -1;
         }
     }
 
@@ -507,7 +541,6 @@ void EC_WriteSDO_Call(EC_WriteSDO *inst, KRON_EC_Config *cfg) {
 
     if (!inst->Execute && inst->_prevExecute) {
         inst->Done = false;
-        inst->Busy = false;
     }
 
     if (rising) {
@@ -515,33 +548,47 @@ void EC_WriteSDO_Call(EC_WriteSDO *inst, KRON_EC_Config *cfg) {
         inst->Busy    = true;
         inst->Error   = false;
         inst->ErrorID = 0;
+        inst->_queue_id = -1;
 
-        if (kron_ec_sdo_queue.state != KRON_EC_SDO_IDLE) {
+        pthread_mutex_lock(&sdo_queue_mutex);
+        for (int i = 0; i < KRON_EC_MAX_SDO_QUEUE_SIZE; i++) {
+            if (sdo_queue[i].state != KRON_EC_SDO_IDLE) continue;
+
+            sdo_queue[i].slave_pos = inst->SlaveAddress;
+            sdo_queue[i].index     = inst->Index;
+            sdo_queue[i].subindex  = inst->SubIndex;
+            sdo_queue[i].byte_size = inst->ByteSize ? inst->ByteSize : 4;
+            sdo_queue[i].value     = inst->Value;
+            sdo_queue[i].state     = KRON_EC_SDO_WRITE_REQ;
+            inst->_queue_id        = i;
+            break;
+        }
+        pthread_mutex_unlock(&sdo_queue_mutex);
+
+        if (inst->_queue_id < 0) {
             inst->Error   = true;
             inst->ErrorID = 0x8020;
             inst->Busy    = false;
-        } else {
-            kron_ec_sdo_queue.slave_pos = inst->SlaveAddress;
-            kron_ec_sdo_queue.index     = inst->Index;
-            kron_ec_sdo_queue.subindex  = inst->SubIndex;
-            kron_ec_sdo_queue.byte_size = inst->ByteSize ? inst->ByteSize : 4;
-            kron_ec_sdo_queue.value     = inst->Value;
-            kron_ec_sdo_queue.state     = KRON_EC_SDO_WRITE_REQ;
         }
     }
 
     /* Poll queue state */
-    if (inst->Busy) {
-        int st = kron_ec_sdo_queue.state;
+    if (inst->Busy && inst->_queue_id >= 0 &&
+        inst->_queue_id < KRON_EC_MAX_SDO_QUEUE_SIZE) {
+        KRON_EC_SDO_Request *req = &sdo_queue[inst->_queue_id];
+        int st = req->state;
+
         if (st == KRON_EC_SDO_DONE_OK) {
-            inst->Done              = true;
-            inst->Busy              = false;
-            kron_ec_sdo_queue.state = KRON_EC_SDO_IDLE;
+            inst->Done      = true;
+            inst->Busy      = false;
+            req->state      = KRON_EC_SDO_IDLE;
+            inst->_queue_id = -1;
         } else if (st == KRON_EC_SDO_DONE_ERR) {
-            inst->Error             = true;
-            inst->ErrorID           = 0x8022;
-            inst->Busy              = false;
-            kron_ec_sdo_queue.state = KRON_EC_SDO_IDLE;
+            inst->Error     = true;
+            inst->ErrorID   = 0x8022;
+            inst->Busy      = false;
+            req->state      = KRON_EC_SDO_IDLE;
+            inst->_queue_id = -1;
         }
     }
 

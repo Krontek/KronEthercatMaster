@@ -125,8 +125,10 @@ typedef struct {
 #define KRON_EC_ERR_OP         -4
 #define KRON_EC_ERR_IO         -5
 
-/* ── Asynchronous SDO request queue (single-slot, thread-safe via volatile) ─ */
+/* ── Asynchronous SDO request queue ───────────────────────────────────────── */
 /* State machine: IDLE(0) → REQUEST(1/2) → DONE_OK(-1) / DONE_ERR(-2)        */
+#define KRON_EC_MAX_SDO_QUEUE_SIZE 16
+
 #define KRON_EC_SDO_IDLE      0
 #define KRON_EC_SDO_WRITE_REQ 1
 #define KRON_EC_SDO_READ_REQ  2
@@ -140,10 +142,7 @@ typedef struct {
     uint8_t       subindex;
     uint8_t       byte_size;  /* 1/2/4                                     */
     uint32_t      value;      /* Write: input value; Read: output result   */
-} KRON_EC_SDO_Queue;
-
-/* Global singleton SDO queue — defined in kronethercatmaster.c             */
-extern KRON_EC_SDO_Queue kron_ec_sdo_queue;
+} KRON_EC_SDO_Request;
 
 /* ── API ──────────────────────────────────────────────────────────────────── */
 
@@ -164,6 +163,12 @@ static inline int  kron_ec_init(KRON_EC_Config *cfg) {
 static inline void kron_ec_pdo_read(KRON_EC_Config *cfg)    { (void)cfg; }
 static inline void kron_ec_pdo_write(KRON_EC_Config *cfg)   { (void)cfg; }
 static inline void kron_ec_close(KRON_EC_Config *cfg)       { if (cfg) { cfg->master_state = KRON_EC_MASTER_NONE; cfg->is_operational = false; cfg->found_slaves = 0; } }
+/* SDO queue storage for sim (real mode uses a static array in .c) */
+#ifndef KRON_EC_SDO_QUEUE_DEFINED
+#define KRON_EC_SDO_QUEUE_DEFINED
+static KRON_EC_SDO_Request kron_ec_sdo_queue[KRON_EC_MAX_SDO_QUEUE_SIZE] = { 0 };
+#endif
+
 static inline void kron_ec_check_state(KRON_EC_Config *cfg) {
     /* In simulation keep all slaves alive */
     if (!cfg) return;
@@ -177,20 +182,19 @@ static inline void kron_ec_check_state(KRON_EC_Config *cfg) {
 }
 static inline void kron_ec_process_sdo(KRON_EC_Config *cfg) {
     (void)cfg;
-    /* In sim: immediately complete any pending SDO request */
-    if (kron_ec_sdo_queue.state == KRON_EC_SDO_WRITE_REQ)
-        kron_ec_sdo_queue.state = KRON_EC_SDO_DONE_OK;
-    else if (kron_ec_sdo_queue.state == KRON_EC_SDO_READ_REQ) {
-        kron_ec_sdo_queue.value = 0;
-        kron_ec_sdo_queue.state = KRON_EC_SDO_DONE_OK;
+    /* In sim: immediately complete the first pending SDO request */
+    for (int _i = 0; _i < KRON_EC_MAX_SDO_QUEUE_SIZE; _i++) {
+        if (kron_ec_sdo_queue[_i].state == KRON_EC_SDO_WRITE_REQ) {
+            kron_ec_sdo_queue[_i].state = KRON_EC_SDO_DONE_OK;
+            break;
+        }
+        if (kron_ec_sdo_queue[_i].state == KRON_EC_SDO_READ_REQ) {
+            kron_ec_sdo_queue[_i].value = 0;
+            kron_ec_sdo_queue[_i].state = KRON_EC_SDO_DONE_OK;
+            break;
+        }
     }
 }
-
-/* SDO queue storage for sim (also defined in .c for real mode) */
-#ifndef KRON_EC_SDO_QUEUE_DEFINED
-#define KRON_EC_SDO_QUEUE_DEFINED
-KRON_EC_SDO_Queue kron_ec_sdo_queue = { KRON_EC_SDO_IDLE, 0, 0, 0, 0, 0 };
-#endif
 
 #else
 /* ── Real SOEM-backed implementations (defined in kronethercatmaster.c) ── */
@@ -267,6 +271,7 @@ typedef struct {
     uint32_t Value;        /* Read value (valid when Done=TRUE) */
     /* Internal */
     bool     _prevExecute;
+    int      _queue_id;
 } EC_ReadSDO;
 
 /* ── EC_WriteSDO ──────────────────────────────────────────────────────────── */
@@ -285,6 +290,7 @@ typedef struct {
     uint16_t ErrorID;
     /* Internal */
     bool     _prevExecute;
+    int      _queue_id;
 } EC_WriteSDO;
 
 /* ── EC FB Call function declarations / inline stubs ─────────────────────── */
