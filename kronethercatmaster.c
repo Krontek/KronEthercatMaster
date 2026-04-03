@@ -156,6 +156,7 @@ int kron_ec_init(KRON_EC_Config *cfg) {
 
     fprintf(stderr, "[kronec] Bus running on %s, %d slave(s) in OP\n",
             cfg->ifname, g_ctx.slavecount);
+    fprintf(stderr, "[kronec] Cycle time: %u us\n", cfg->cycle_us);
     return KRON_EC_OK;
 }
 
