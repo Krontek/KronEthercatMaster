@@ -87,7 +87,6 @@ static void kron_ec_init_sdo_queue(void) {
 /* ── PO2SO hook — called by SOEM for each slave during PREOP→SAFEOP ─────── */
 
 static int kron_po2so_hook(ecx_contextt *ctx, uint16 slave) {
-    (void)ctx;
     if (!g_cfg_ptr) return 1;
     for (int si = 0; si < g_cfg_ptr->slave_count; si++) {
         KRON_EC_Slave *sl = &g_cfg_ptr->slaves[si];
@@ -97,6 +96,14 @@ static int kron_po2so_hook(ecx_contextt *ctx, uint16 slave) {
             if (do_sdo_write(slave, s->index, s->subindex, s->byte_size, s->value) != KRON_EC_OK)
                 fprintf(stderr, "[kronec] PO2SO SDO failed: slave %d 0x%04X:%02X\n",
                         slave, s->index, s->subindex);
+        }
+        /* Activate DC SYNC0 on this slave — required for CSP/CSV/CST modes.
+         * cycle_ns derived from the configured bus cycle time (microseconds). */
+        if (g_cfg_ptr->dc_enable && g_cfg_ptr->cycle_us > 0) {
+            int64_t cycle_ns = (int64_t)g_cfg_ptr->cycle_us * 1000LL;
+            ecx_dcsync0(ctx, slave, TRUE, (uint32)cycle_ns, 0);
+            fprintf(stderr, "[kronec] Slave %d: DC SYNC0 activated (cycle: %u us)\n",
+                    slave, g_cfg_ptr->cycle_us);
         }
         break;
     }
