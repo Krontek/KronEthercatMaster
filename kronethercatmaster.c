@@ -97,14 +97,6 @@ static int kron_po2so_hook(ecx_contextt *ctx, uint16 slave) {
                 fprintf(stderr, "[kronec] PO2SO SDO failed: slave %d 0x%04X:%02X\n",
                         slave, s->index, s->subindex);
         }
-        /* Activate DC SYNC0 on this slave — required for CSP/CSV/CST modes.
-         * cycle_ns derived from the configured bus cycle time (microseconds). */
-        if (g_cfg_ptr->dc_enable && g_cfg_ptr->cycle_us > 0) {
-            int64_t cycle_ns = (int64_t)g_cfg_ptr->cycle_us * 1000LL;
-            ecx_dcsync0(ctx, slave, TRUE, (uint32)cycle_ns, 0);
-            fprintf(stderr, "[kronec] Slave %d: DC SYNC0 activated (cycle: %u us)\n",
-                    slave, g_cfg_ptr->cycle_us);
-        }
         break;
     }
     return 1;
@@ -153,6 +145,17 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     /* Distributed clocks */
     if (cfg->dc_enable) {
         ecx_configdc(&g_ctx);
+        /* Activate DC SYNC0 on each configured slave — must happen AFTER
+         * ecx_configdc() so the DC system is initialised.  Required for
+         * CSP / CSV / CST drive modes. */
+        if (cfg->cycle_us > 0) {
+            uint32 cycle_ns = (uint32)((uint64_t)cfg->cycle_us * 1000ULL);
+            for (int i = 1; i <= g_ctx.slavecount; i++) {
+                ecx_dcsync0(&g_ctx, (uint16)i, TRUE, cycle_ns, 0);
+                fprintf(stderr, "[kronec] Slave %d: DC SYNC0 activated (cycle: %u us)\n",
+                        i, cfg->cycle_us);
+            }
+        }
     }
 
     /* Wait for SAFE-OP */
