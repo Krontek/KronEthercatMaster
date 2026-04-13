@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  KronEthercatMaster — Error Code Catalog
+  Per-block error codes for EtherCAT diagnostic function blocks.
+  ErrorID field (uint16_t): 0 = no error, positive values = error codes.
+-->
+<error_codes library="KronEthercatMaster">
+
+  <block type="EC_GetMasterState">
+    <error code="1" name="ERR_NULL_CFG" text="NULL master configuration pointer" />
+  </block>
+
+  <block type="EC_GetSlaveState">
+    <error code="1" name="ERR_INVALID_SLAVE" text="SlaveAddress out of range or slave not found" />
+  </block>
+
+  <block type="EC_ResetBus">
+    <error code="1" name="ERR_NULL_CFG" text="NULL master configuration pointer" />
+    <error code="2" name="ERR_INIT" text="EtherCAT master initialization failed" />
+    <error code="3" name="ERR_NO_SLAVES" text="No EtherCAT slaves found on bus" />
+    <error code="4" name="ERR_CONFIG" text="Slave configuration mismatch" />
+    <error code="5" name="ERR_OP" text="Failed to transition bus to OP state" />
+  </block>
+
+  <block type="EC_ReadSDO">
+    <error code="1" name="ERR_QUEUE_FULL" text="SDO request queue is full" />
+    <error code="2" name="ERR_SDO_FAILED" text="SDO read operation failed (check slave and object index)" />
+  </block>
+
+  <block type="EC_WriteSDO">
+    <error code="1" name="ERR_QUEUE_FULL" text="SDO request queue is full" />
+    <error code="2" name="ERR_SDO_FAILED" text="SDO write operation failed (check slave and object index)" />
+  </block>
+
+</error_codes>

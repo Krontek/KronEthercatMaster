@@ -414,7 +414,7 @@ void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg) {
     }
     /* Slave not in configured list */
     inst->Error   = true;
-    inst->ErrorID = 0x8010; /* Unknown slave address */
+    inst->ErrorID = 1; /* ERR_INVALID_SLAVE: address not in configured list */
     inst->_prevEnable = inst->Enable;
 }
 
@@ -431,13 +431,12 @@ void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg) {
  * which causes the IO_Bus thread to skip kron_ec_pdo_read/write during
  * the brief reinit window — no mutex needed.
  *
- * ErrorID mapping on failure:
- *   0x8001 — null cfg pointer
- *   0x8011 — ecx_init failed (NIC/driver error)
- *   0x8012 — no slaves found on bus
- *   0x8013 — PDO/IOmap config error
- *   0x8014 — could not reach OP state
- *   0x8002 — init returned OK but bus still not fully operational
+ * ErrorID mapping on failure (see error_codes.xml):
+ *   1 — null cfg pointer
+ *   2 — ecx_init failed (NIC/driver error)
+ *   3 — no slaves found on bus
+ *   4 — PDO/IOmap config error
+ *   5 — could not reach OP state
  */
 void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
     bool rising = inst->Execute && !inst->_prevExecute;
@@ -452,7 +451,7 @@ void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
 
         if (!cfg) {
             inst->Error   = true;
-            inst->ErrorID = 0x8001;
+            inst->ErrorID = 1; /* ERR_NULL_CFG */
             inst->Busy    = false;
         } else {
             int rc = kron_ec_init(cfg);
@@ -463,11 +462,11 @@ void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
             } else {
                 inst->Error = true;
                 switch (rc) {
-                    case KRON_EC_ERR_INIT:      inst->ErrorID = 0x8011; break;
-                    case KRON_EC_ERR_NO_SLAVES:  inst->ErrorID = 0x8012; break;
-                    case KRON_EC_ERR_CONFIG:     inst->ErrorID = 0x8013; break;
-                    case KRON_EC_ERR_OP:         inst->ErrorID = 0x8014; break;
-                    default:                     inst->ErrorID = 0x8002; break;
+                    case KRON_EC_ERR_INIT:       inst->ErrorID = 2; break; /* ERR_INIT */
+                    case KRON_EC_ERR_NO_SLAVES:  inst->ErrorID = 3; break; /* ERR_NO_SLAVES */
+                    case KRON_EC_ERR_CONFIG:      inst->ErrorID = 4; break; /* ERR_CONFIG */
+                    case KRON_EC_ERR_OP:          inst->ErrorID = 5; break; /* ERR_OP */
+                    default:                      inst->ErrorID = 5; break; /* ERR_OP (generic) */
                 }
             }
         }
@@ -515,7 +514,7 @@ void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
 
         if (inst->_queue_id < 0) {
             inst->Error   = true;
-            inst->ErrorID = 0x8020;
+            inst->ErrorID = 1; /* ERR_QUEUE_FULL */
             inst->Busy    = false;
         }
     }
@@ -534,7 +533,7 @@ void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
             inst->_queue_id  = -1;
         } else if (st == KRON_EC_SDO_DONE_ERR) {
             inst->Error      = true;
-            inst->ErrorID    = 0x8021;
+            inst->ErrorID    = 2; /* ERR_SDO_FAILED */
             inst->Busy       = false;
             req->state       = KRON_EC_SDO_IDLE;
             inst->_queue_id  = -1;
@@ -577,7 +576,7 @@ void EC_WriteSDO_Call(EC_WriteSDO *inst, KRON_EC_Config *cfg) {
 
         if (inst->_queue_id < 0) {
             inst->Error   = true;
-            inst->ErrorID = 0x8020;
+            inst->ErrorID = 1; /* ERR_QUEUE_FULL */
             inst->Busy    = false;
         }
     }
@@ -595,7 +594,7 @@ void EC_WriteSDO_Call(EC_WriteSDO *inst, KRON_EC_Config *cfg) {
             inst->_queue_id = -1;
         } else if (st == KRON_EC_SDO_DONE_ERR) {
             inst->Error     = true;
-            inst->ErrorID   = 0x8022;
+            inst->ErrorID   = 2; /* ERR_SDO_FAILED */
             inst->Busy      = false;
             req->state      = KRON_EC_SDO_IDLE;
             inst->_queue_id = -1;
