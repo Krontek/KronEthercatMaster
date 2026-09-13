@@ -243,6 +243,9 @@ typedef struct {
 } EC_GetSlaveState;
 
 /* ── EC_ResetBus ──────────────────────────────────────────────────────────── */
+/* Asynchronous: the rising edge of Execute posts a reinit request that the
+ * background service thread performs; poll Done/Busy/Error each scan.
+ * ErrorID: 1 null cfg, 2 init, 3 no slaves, 4 config, 5 no OP, 6 busy.      */
 typedef struct {
     /* VAR_INPUT */
     bool     Execute;
@@ -256,6 +259,7 @@ typedef struct {
 } EC_ResetBus;
 
 /* ── EC_ReadSDO ───────────────────────────────────────────────────────────── */
+/* ErrorID: 1 queue full, 2 transfer failed, 3 busy (re-triggered in flight). */
 typedef struct {
     /* VAR_INPUT */
     bool     Execute;
@@ -275,6 +279,7 @@ typedef struct {
 } EC_ReadSDO;
 
 /* ── EC_WriteSDO ──────────────────────────────────────────────────────────── */
+/* ErrorID: 1 queue full, 2 transfer failed, 3 busy (re-triggered in flight). */
 typedef struct {
     /* VAR_INPUT */
     bool     Execute;

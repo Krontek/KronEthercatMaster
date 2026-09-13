@@ -32,6 +32,22 @@ static pthread_mutex_t g_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
 static KRON_EC_SDO_Request sdo_queue[KRON_EC_MAX_SDO_QUEUE_SIZE];
 static pthread_mutex_t sdo_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── Asynchronous bus-reset request ──────────────────────────────────────── */
+/* kron_ec_init() performs blocking network I/O (bus scan plus statecheck
+ * timeouts, ~10 s worst case with SOEM defaults). EC_ResetBus runs in the PLC
+ * scan, so it must not call it directly — it posts a request here and the
+ * background service thread (kron_ec_process_sdo) performs the reinit, the
+ * same pattern the SDO blocks already use. */
+#define KRON_EC_RESET_IDLE      0
+#define KRON_EC_RESET_REQ       1
+#define KRON_EC_RESET_RUNNING   2
+#define KRON_EC_RESET_DONE_OK  -1
+#define KRON_EC_RESET_DONE_ERR -2
+
+static int g_reset_state = KRON_EC_RESET_IDLE;
+static int g_reset_rc    = KRON_EC_OK;
+static pthread_mutex_t g_reset_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* ── helpers ──────────────────────────────────────────────────────────────── */
 
 static uint8_t dtype_bytes(KRON_EC_DataType dt) {
@@ -49,6 +65,21 @@ static uint8_t dtype_bytes(KRON_EC_DataType dt) {
         case KRON_EC_DTYPE_REAL64: return 8;
         default:                   return 1;
     }
+}
+
+/* Size of a slave's segment in the IOmap. SOEM reports Ibytes/Obytes as 0 when
+ * fewer than 8 bits are mapped, but a whole byte is still allocated, so round
+ * the bit count up instead of trusting the zero. */
+static uint32_t slave_in_bytes(uint16_t pos) {
+    uint32_t b = g_ctx.slavelist[pos].Ibytes;
+    if (b == 0u && g_ctx.slavelist[pos].Ibits > 0u) b = 1u;
+    return b;
+}
+
+static uint32_t slave_out_bytes(uint16_t pos) {
+    uint32_t b = g_ctx.slavelist[pos].Obytes;
+    if (b == 0u && g_ctx.slavelist[pos].Obits > 0u) b = 1u;
+    return b;
 }
 
 static int do_sdo_write(uint16_t slave, uint16_t idx, uint8_t sub,
@@ -71,15 +102,27 @@ static int do_sdo_read(uint16_t slave, uint16_t idx, uint8_t sub,
     return KRON_EC_ERR_IO;
 }
 
+/*
+ * Called by kron_ec_init(), i.e. also on an EC_ResetBus reinit while the PLC
+ * scan is running. Slots owned by an EC_ReadSDO/EC_WriteSDO instance that is
+ * currently Busy must NOT be silently reset to IDLE: their owner polls the
+ * slot every scan and would wait on it forever. Fail them instead, so the
+ * owning block reports ERR_SDO_FAILED and releases the slot itself.
+ * At cold boot the array is static-zeroed, so every slot is already IDLE.
+ */
 static void kron_ec_init_sdo_queue(void) {
     pthread_mutex_lock(&sdo_queue_mutex);
     for (int i = 0; i < KRON_EC_MAX_SDO_QUEUE_SIZE; i++) {
-        sdo_queue[i].state     = KRON_EC_SDO_IDLE;
-        sdo_queue[i].slave_pos = 0;
-        sdo_queue[i].index     = 0;
-        sdo_queue[i].subindex  = 0;
-        sdo_queue[i].byte_size = 0;
-        sdo_queue[i].value     = 0;
+        if (sdo_queue[i].state == KRON_EC_SDO_IDLE) {
+            sdo_queue[i].slave_pos = 0;
+            sdo_queue[i].index     = 0;
+            sdo_queue[i].subindex  = 0;
+            sdo_queue[i].byte_size = 0;
+            sdo_queue[i].value     = 0;
+        } else {
+            /* In flight or awaiting pickup across a bus reinit — fail it. */
+            sdo_queue[i].state = KRON_EC_SDO_DONE_ERR;
+        }
     }
     pthread_mutex_unlock(&sdo_queue_mutex);
 }
@@ -100,6 +143,57 @@ static int kron_po2so_hook(ecx_contextt *ctx, uint16 slave) {
         break;
     }
     return 1;
+}
+
+/* ── kron_ec_pdo_map_check ───────────────────────────────────────────────── */
+/*
+ * The PDO entry list comes from the project configuration (KronEditor UI) and
+ * is not validated against what the slave actually maps. Without this check a
+ * too-long or mistyped entry list walks past the slave's IOmap segment and
+ * silently reads/writes the neighbouring slave's process data.
+ *
+ * Called once after ecx_config_map_group(), when Ibytes/Obytes are known.
+ * Returns KRON_EC_OK, or KRON_EC_ERR_CONFIG after reporting every offender.
+ */
+static int kron_ec_pdo_map_check(KRON_EC_Config *cfg) {
+    int rc = KRON_EC_OK;
+
+    for (int si = 0; si < cfg->slave_count; si++) {
+        KRON_EC_Slave *sl  = &cfg->slaves[si];
+        uint16_t       pos = sl->position;
+
+        if (pos < 1 || pos > (uint16_t)g_ctx.slavecount) {
+            fprintf(stderr, "[kronec] Config error: slave '%s' at position %u, "
+                            "but only %d slave(s) on the bus\n",
+                    sl->name, pos, g_ctx.slavecount);
+            rc = KRON_EC_ERR_CONFIG;
+            continue;
+        }
+
+        uint32_t in_lim  = slave_in_bytes(pos);
+        uint32_t out_lim = slave_out_bytes(pos);
+        uint32_t in_off = 0u, out_off = 0u;
+
+        for (int i = 0; i < sl->pdo_count; i++) {
+            KRON_EC_PDO_Entry *e   = &sl->pdo_entries[i];
+            uint32_t           sz  = dtype_bytes(e->dtype);
+            bool               in  = (e->dir == KRON_EC_DIR_INPUT);
+            uint32_t          *off = in ? &in_off : &out_off;
+            uint32_t           lim = in ? in_lim  : out_lim;
+
+            if (*off + sz > lim) {
+                fprintf(stderr, "[kronec] Config error: slave %u '%s' PDO '%s' "
+                                "(0x%04X:%02X) needs %s bytes %u..%u but the "
+                                "slave maps only %u\n",
+                        pos, sl->name, e->name ? e->name : "?",
+                        e->index, e->subindex, in ? "input" : "output",
+                        *off, *off + sz - 1u, lim);
+                rc = KRON_EC_ERR_CONFIG;
+            }
+            *off += sz;
+        }
+    }
+    return rc;
 }
 
 /* ── kron_ec_init ─────────────────────────────────────────────────────────── */
@@ -141,6 +235,14 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     }
 
     ecx_config_map_group(&g_ctx, g_IOmap, 0);
+
+    /* Refuse to run with a PDO list that does not fit the slaves' IOmap
+     * segments — otherwise pdo_read/pdo_write would cross into a neighbour. */
+    if (kron_ec_pdo_map_check(cfg) != KRON_EC_OK) {
+        ecx_close(&g_ctx);
+        cfg->master_state = KRON_EC_MASTER_ERROR;
+        return KRON_EC_ERR_CONFIG;
+    }
 
     /* Distributed clocks */
     if (cfg->dc_enable) {
@@ -217,16 +319,18 @@ void kron_ec_pdo_read(KRON_EC_Config *cfg) {
         uint8_t *inputs = (uint8_t *)g_ctx.slavelist[pos].inputs;
         if (!inputs) continue;
 
-        int byte_off = 0;
+        /* kron_ec_pdo_map_check() rejects an over-long map at init; this is the
+         * belt-and-braces guard so a bad offset can never reach the neighbour's
+         * IOmap segment on the RT path. */
+        uint32_t lim = slave_in_bytes(pos);
+
+        uint32_t byte_off = 0u;
         for (int i = 0; i < sl->pdo_count; i++) {
             KRON_EC_PDO_Entry *e = &sl->pdo_entries[i];
-            if (e->dir != KRON_EC_DIR_INPUT || !e->var_ptr) {
-                if (e->dir == KRON_EC_DIR_INPUT)
-                    byte_off += dtype_bytes(e->dtype);
-                continue;
-            }
-            uint8_t sz = dtype_bytes(e->dtype);
-            memcpy(e->var_ptr, inputs + byte_off, sz);
+            if (e->dir != KRON_EC_DIR_INPUT) continue;
+            uint32_t sz = dtype_bytes(e->dtype);
+            if (byte_off + sz > lim) break;
+            if (e->var_ptr) memcpy(e->var_ptr, inputs + byte_off, sz);
             byte_off += sz;
         }
     }
@@ -249,16 +353,16 @@ void kron_ec_pdo_write(KRON_EC_Config *cfg) {
         uint8_t *outputs = (uint8_t *)g_ctx.slavelist[pos].outputs;
         if (!outputs) continue;
 
-        int byte_off = 0;
+        /* See kron_ec_pdo_read — never write past this slave's segment. */
+        uint32_t lim = slave_out_bytes(pos);
+
+        uint32_t byte_off = 0u;
         for (int i = 0; i < sl->pdo_count; i++) {
             KRON_EC_PDO_Entry *e = &sl->pdo_entries[i];
-            if (e->dir != KRON_EC_DIR_OUTPUT || !e->var_ptr) {
-                if (e->dir == KRON_EC_DIR_OUTPUT)
-                    byte_off += dtype_bytes(e->dtype);
-                continue;
-            }
-            uint8_t sz = dtype_bytes(e->dtype);
-            memcpy(outputs + byte_off, e->var_ptr, sz);
+            if (e->dir != KRON_EC_DIR_OUTPUT) continue;
+            uint32_t sz = dtype_bytes(e->dtype);
+            if (byte_off + sz > lim) break;
+            if (e->var_ptr) memcpy(outputs + byte_off, e->var_ptr, sz);
             byte_off += sz;
         }
     }
@@ -327,7 +431,24 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
  * This keeps SDO traffic completely off the real-time PDO path.
  */
 void kron_ec_process_sdo(KRON_EC_Config *cfg) {
-    (void)cfg;
+    /* A pending EC_ResetBus request is serviced here, on this thread, because
+     * kron_ec_init() blocks for seconds and must never run in the PLC scan. */
+    pthread_mutex_lock(&g_reset_mutex);
+    bool do_reset = (g_reset_state == KRON_EC_RESET_REQ);
+    if (do_reset) g_reset_state = KRON_EC_RESET_RUNNING;
+    pthread_mutex_unlock(&g_reset_mutex);
+
+    if (do_reset) {
+        int rc = kron_ec_init(cfg);
+
+        pthread_mutex_lock(&g_reset_mutex);
+        g_reset_rc    = rc;
+        g_reset_state = (rc == KRON_EC_OK && cfg && cfg->is_operational)
+                            ? KRON_EC_RESET_DONE_OK : KRON_EC_RESET_DONE_ERR;
+        pthread_mutex_unlock(&g_reset_mutex);
+        return;  /* the bus was just reinitialised — SDOs wait for next tick */
+    }
+
     for (int i = 0; i < KRON_EC_MAX_SDO_QUEUE_SIZE; i++) {
         int st = sdo_queue[i].state;
 
@@ -427,6 +548,11 @@ void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg) {
  * cycle the slave boots from scratch (INIT state, no IOmap), so the
  * master must also rebuild its context from scratch.
  *
+ * Non-blocking: kron_ec_init() takes seconds (bus scan + statecheck timeouts),
+ * so this block only posts a request on the rising edge of Execute and polls
+ * it each scan; the background service thread (kron_ec_process_sdo) performs
+ * the reinit. Re-triggering while Busy is rejected with ErrorID 6.
+ *
  * kron_ec_init() sets cfg->is_operational = false before touching SOEM,
  * which causes the IO_Bus thread to skip kron_ec_pdo_read/write during
  * the brief reinit window — no mutex needed.
@@ -435,13 +561,23 @@ void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg) {
  *   1 — null cfg pointer
  *   2 — ecx_init failed (NIC/driver error)
  *   3 — no slaves found on bus
- *   4 — PDO/IOmap config error
+ *   4 — PDO/IOmap config error (includes a PDO map longer than the slave's
+ *       IOmap segment — see kron_ec_pdo_map_check)
  *   5 — could not reach OP state
+ *   6 — busy: a reset is already in progress
  */
 void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
     bool rising = inst->Execute && !inst->_prevExecute;
 
     if (!inst->Execute && inst->_prevExecute) { inst->Done = false; }
+
+    if (rising && inst->Busy) {
+        /* A reset is already running — reject the new trigger and leave the
+         * request in flight (same rule as the SDO blocks). */
+        inst->Error   = true;
+        inst->ErrorID = 6; /* ERR_BUSY */
+        rising = false;
+    }
 
     if (rising) {
         inst->Done    = false;
@@ -454,23 +590,45 @@ void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
             inst->ErrorID = 1; /* ERR_NULL_CFG */
             inst->Busy    = false;
         } else {
-            int rc = kron_ec_init(cfg);
-
-            inst->Busy = false;
-            if (rc == KRON_EC_OK && cfg->is_operational) {
-                inst->Done = true;
+            /* Post the request; the service thread runs the (blocking) init. */
+            pthread_mutex_lock(&g_reset_mutex);
+            if (g_reset_state == KRON_EC_RESET_IDLE) {
+                g_reset_rc    = KRON_EC_OK;
+                g_reset_state = KRON_EC_RESET_REQ;
             } else {
-                inst->Error = true;
-                switch (rc) {
-                    case KRON_EC_ERR_INIT:       inst->ErrorID = 2; break; /* ERR_INIT */
-                    case KRON_EC_ERR_NO_SLAVES:  inst->ErrorID = 3; break; /* ERR_NO_SLAVES */
-                    case KRON_EC_ERR_CONFIG:      inst->ErrorID = 4; break; /* ERR_CONFIG */
-                    case KRON_EC_ERR_OP:          inst->ErrorID = 5; break; /* ERR_OP */
-                    default:                      inst->ErrorID = 5; break; /* ERR_OP (generic) */
-                }
+                inst->Error   = true;
+                inst->ErrorID = 6; /* ERR_BUSY — another block owns the reset */
+                inst->Busy    = false;
+            }
+            pthread_mutex_unlock(&g_reset_mutex);
+        }
+    }
+
+    /* Poll the request state — one scan cycle each, never blocking. */
+    if (inst->Busy) {
+        pthread_mutex_lock(&g_reset_mutex);
+        int st = g_reset_state;
+        int rc = g_reset_rc;
+        if (st == KRON_EC_RESET_DONE_OK || st == KRON_EC_RESET_DONE_ERR)
+            g_reset_state = KRON_EC_RESET_IDLE;
+        pthread_mutex_unlock(&g_reset_mutex);
+
+        if (st == KRON_EC_RESET_DONE_OK) {
+            inst->Done = true;
+            inst->Busy = false;
+        } else if (st == KRON_EC_RESET_DONE_ERR) {
+            inst->Busy  = false;
+            inst->Error = true;
+            switch (rc) {
+                case KRON_EC_ERR_INIT:       inst->ErrorID = 2; break; /* ERR_INIT */
+                case KRON_EC_ERR_NO_SLAVES:  inst->ErrorID = 3; break; /* ERR_NO_SLAVES */
+                case KRON_EC_ERR_CONFIG:     inst->ErrorID = 4; break; /* ERR_CONFIG */
+                case KRON_EC_ERR_OP:         inst->ErrorID = 5; break; /* ERR_OP */
+                default:                     inst->ErrorID = 5; break; /* ERR_OP (generic) */
             }
         }
     }
+
     inst->_prevExecute = inst->Execute;
 }
 
@@ -479,6 +637,9 @@ void EC_ResetBus_Call(EC_ResetBus *inst, KRON_EC_Config *cfg) {
  * Non-blocking: posts a request to the global SDO queue on rising edge of
  * Execute, then polls state each cycle. Done/Error/Value set when the
  * SDO background thread completes the transfer.
+ *
+ * ErrorID: 1 — queue full, 2 — SDO transfer failed, 3 — busy (re-triggered
+ * while the previous request was still in flight; the new trigger is ignored).
  */
 void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
     (void)cfg;
@@ -487,6 +648,16 @@ void EC_ReadSDO_Call(EC_ReadSDO *inst, KRON_EC_Config *cfg) {
     if (!inst->Execute && inst->_prevExecute) {
         inst->Done  = false;
         inst->Value = 0;
+    }
+
+    if (rising && inst->Busy) {
+        /* The previous request is still in flight. Overwriting _queue_id here
+         * would orphan its queue slot: the service thread parks it in DONE_OK /
+         * DONE_ERR and nobody ever returns it to IDLE, so 16 such re-triggers
+         * exhaust the queue permanently. Reject the trigger instead. */
+        inst->Error   = true;
+        inst->ErrorID = 3; /* ERR_BUSY */
+        rising = false;
     }
 
     if (rising) {
@@ -550,6 +721,16 @@ void EC_WriteSDO_Call(EC_WriteSDO *inst, KRON_EC_Config *cfg) {
 
     if (!inst->Execute && inst->_prevExecute) {
         inst->Done = false;
+    }
+
+    if (rising && inst->Busy) {
+        /* The previous request is still in flight. Overwriting _queue_id here
+         * would orphan its queue slot: the service thread parks it in DONE_OK /
+         * DONE_ERR and nobody ever returns it to IDLE, so 16 such re-triggers
+         * exhaust the queue permanently. Reject the trigger instead. */
+        inst->Error   = true;
+        inst->ErrorID = 3; /* ERR_BUSY */
+        rising = false;
     }
 
     if (rising) {
