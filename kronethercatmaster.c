@@ -24,6 +24,17 @@ static char          g_IOmap[4096];
 static KRON_EC_Config *g_cfg_ptr = NULL;
 
 /* ── EtherCAT context mutex ──────────────────────────────────────────────── */
+/* How long to exchange process data after ecx_configdc() before arming SYNC0,
+ * and how many pumped attempts a state transition gets. Both are deliberately
+ * generous: they run once at start-up, and being too impatient here is what
+ * leaves a conformant drive parked in SAFE-OP. */
+#ifndef KRON_EC_DC_SETTLE_FRAMES
+#  define KRON_EC_DC_SETTLE_FRAMES 2000
+#endif
+#ifndef KRON_EC_OP_ATTEMPTS
+#  define KRON_EC_OP_ATTEMPTS 200
+#endif
+
 /* SOEM is NOT thread-safe: ecx_SDOread/write and ecx_send/receive_processdata
  * share the same socket. This mutex serializes SDO and PDO access. */
 static pthread_mutex_t g_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -196,6 +207,71 @@ static int kron_ec_pdo_map_check(KRON_EC_Config *cfg) {
     return rc;
 }
 
+/* ── SOEM context lifetime ─────────────────────────────────────────────────
+ *
+ * ⚠️ ecx_close() must run EXACTLY ONCE per successful ecx_init(). kron_ec_init
+ * closes the context on each of its own failure paths and returns an error, but
+ * kron_ec_close() — called from PLC_Cleanup when the user stops the runtime —
+ * closed it again unconditionally. A bus that failed to reach OP therefore ended
+ * every run with "free(): double free detected in tcache 2", killing the process
+ * at shutdown and making a configuration problem look like memory corruption.
+ */
+static bool g_ctx_open = false;
+
+static void kron_ec_close_ctx(void) {
+    if (!g_ctx_open) return;
+    g_ctx_open = false;
+    ecx_close(&g_ctx);
+}
+
+/* Exchange process data for a while. Used both to let the DC clocks converge
+ * and to keep traffic flowing while a state transition is pending — SOEM
+ * distributes the DC reference time inside send_processdata, so a bus that is
+ * never pumped never synchronises. */
+static void kron_ec_pump(int frames, uint32_t cycle_us) {
+    struct timespec ts;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = (long)((cycle_us ? cycle_us : 1000) * 1000UL);
+    for (int i = 0; i < frames; i++) {
+        ecx_send_processdata(&g_ctx);
+        ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* Arm or disarm DC SYNC0 on every slave. */
+static void kron_ec_sync0(KRON_EC_Config *cfg, bool on) {
+    uint32 cycle_ns = (uint32)((uint64_t)(cfg->cycle_us ? cfg->cycle_us : 1000) * 1000ULL);
+    for (int i = 1; i <= g_ctx.slavecount; i++) {
+        ecx_dcsync0(&g_ctx, (uint16)i, on ? TRUE : FALSE, on ? cycle_ns : 0, 0);
+    }
+}
+
+/* Request OPERATIONAL with process data FLOWING.
+ *
+ * ⚠️ A single send/receive round followed by one statecheck is not enough: a
+ * slave leaves SAFE-OP only while it is receiving valid process data, so the
+ * frames have to keep coming during the transition. This is the loop every
+ * SOEM example uses; the old code primed the IOmap once and then just waited.
+ */
+static bool kron_ec_request_op(uint32_t cycle_us) {
+    g_ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
+    ecx_send_processdata(&g_ctx);
+    ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
+    ecx_writestate(&g_ctx, 0);
+    for (int chk = 0; chk < KRON_EC_OP_ATTEMPTS; chk++) {
+        ecx_send_processdata(&g_ctx);
+        ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
+        if (ecx_statecheck(&g_ctx, 0, EC_STATE_OPERATIONAL, 50000) == EC_STATE_OPERATIONAL)
+            return true;
+        if (cycle_us) {
+            struct timespec ts = { 0, (long)(cycle_us * 1000UL) };
+            nanosleep(&ts, NULL);
+        }
+    }
+    return false;
+}
+
 /* ── kron_ec_init ─────────────────────────────────────────────────────────── */
 
 int kron_ec_init(KRON_EC_Config *cfg) {
@@ -214,12 +290,13 @@ int kron_ec_init(KRON_EC_Config *cfg) {
         cfg->master_state = KRON_EC_MASTER_ERROR;
         return KRON_EC_ERR_INIT;
     }
+    g_ctx_open = true;
     cfg->master_state = KRON_EC_MASTER_INIT;
 
     int found = ecx_config_init(&g_ctx);
     if (found <= 0) {
         fprintf(stderr, "[kronec] No EtherCAT slaves found on %s\n", cfg->ifname);
-        ecx_close(&g_ctx);
+        kron_ec_close_ctx();
         cfg->master_state = KRON_EC_MASTER_ERROR;
         return KRON_EC_ERR_NO_SLAVES;
     }
@@ -239,43 +316,69 @@ int kron_ec_init(KRON_EC_Config *cfg) {
     /* Refuse to run with a PDO list that does not fit the slaves' IOmap
      * segments — otherwise pdo_read/pdo_write would cross into a neighbour. */
     if (kron_ec_pdo_map_check(cfg) != KRON_EC_OK) {
-        ecx_close(&g_ctx);
+        kron_ec_close_ctx();
         cfg->master_state = KRON_EC_MASTER_ERROR;
         return KRON_EC_ERR_CONFIG;
     }
 
-    /* Distributed clocks */
+    /* Distributed clocks.
+     *
+     * ⚠️ ORDER MATTERS AND USED TO BE WRONG. ecx_configdc() only measures
+     * propagation delays and picks the reference clock; the reference TIME is
+     * distributed by the FRMW datagram that rides inside every
+     * ecx_send_processdata(). Arming SYNC0 immediately after configdc — before
+     * a single frame has circulated — leaves every slave with an unsynchronised
+     * clock, and a conformant drive then refuses OPERATIONAL and parks in
+     * SAFE-OP reporting ALstatuscode 0x0000, i.e. with nothing to explain it.
+     * Measured on real hardware: DC off → OP, DC on → SAFE-OP, regardless of
+     * how OP was requested. So: configure, PUMP until the clocks converge, and
+     * only then arm SYNC0. */
     if (cfg->dc_enable) {
         ecx_configdc(&g_ctx);
-        /* Activate DC SYNC0 on each configured slave — must happen AFTER
-         * ecx_configdc() so the DC system is initialised.  Required for
-         * CSP / CSV / CST drive modes. */
-        if (cfg->cycle_us > 0) {
-            uint32 cycle_ns = (uint32)((uint64_t)cfg->cycle_us * 1000ULL);
-            for (int i = 1; i <= g_ctx.slavecount; i++) {
-                ecx_dcsync0(&g_ctx, (uint16)i, TRUE, cycle_ns, 0);
-                fprintf(stderr, "[kronec] Slave %d: DC SYNC0 activated (cycle: %u us)\n",
-                        i, cfg->cycle_us);
-            }
-        }
+        kron_ec_pump(KRON_EC_DC_SETTLE_FRAMES, cfg->cycle_us);
+        kron_ec_sync0(cfg, true);
+        fprintf(stderr, "[kronec] DC: clocks settled over %d frames, SYNC0 armed (cycle: %u us)\n",
+                KRON_EC_DC_SETTLE_FRAMES, cfg->cycle_us);
     }
 
     /* Wait for SAFE-OP */
     ecx_statecheck(&g_ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
     cfg->master_state = KRON_EC_MASTER_SAFEOP;
 
-    /* One cycle to prime the IOmap */
-    ecx_send_processdata(&g_ctx);
-    ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
+    bool op = kron_ec_request_op(cfg->cycle_us);
 
-    /* Request OP */
-    g_ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
-    ecx_writestate(&g_ctx, 0);
-    ecx_statecheck(&g_ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+    /* ⚠️ Fallback, and a deliberate one: both orders are legal and drives
+     * disagree about which they accept. Some refuse to leave SAFE-OP while
+     * SYNC0 is already firing (they want to be in OP before they are
+     * synchronised), others require SYNC0 first. Trying the standard order and
+     * then the other one makes the master work across drives instead of across
+     * one drive. */
+    if (!op && cfg->dc_enable) {
+        fprintf(stderr, "[kronec] OP refused with SYNC0 armed — retrying with SYNC0 armed AFTER OP\n");
+        kron_ec_sync0(cfg, false);
+        kron_ec_pump(64, cfg->cycle_us);
+        op = kron_ec_request_op(cfg->cycle_us);
+        if (op) {
+            kron_ec_sync0(cfg, true);
+            kron_ec_pump(64, cfg->cycle_us);
+            /* Arming SYNC0 can knock a slave back out of OP; make sure it stuck. */
+            if (ecx_statecheck(&g_ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE) != EC_STATE_OPERATIONAL) {
+                fprintf(stderr, "[kronec] Slave left OP when SYNC0 was armed — continuing without DC SYNC0\n");
+                kron_ec_sync0(cfg, false);
+                op = kron_ec_request_op(cfg->cycle_us);
+            }
+        }
+    }
 
-    if (g_ctx.slavelist[0].state != EC_STATE_OPERATIONAL) {
-        fprintf(stderr, "[kronec] Could not reach OP state\n");
-        ecx_close(&g_ctx);
+    if (!op) {
+        fprintf(stderr, "[kronec] Could not reach OP state (bus is 0x%02X)\n",
+                g_ctx.slavelist[0].state);
+        for (int i = 1; i <= g_ctx.slavecount; i++) {
+            fprintf(stderr, "[kronec]   slave %d state=0x%02X ALstatuscode=0x%04X %s\n",
+                    i, g_ctx.slavelist[i].state, g_ctx.slavelist[i].ALstatuscode,
+                    ec_ALstatuscode2string(g_ctx.slavelist[i].ALstatuscode));
+        }
+        kron_ec_close_ctx();
         cfg->master_state = KRON_EC_MASTER_ERROR;
         return KRON_EC_ERR_OP;
     }
@@ -485,9 +588,13 @@ void kron_ec_process_sdo(KRON_EC_Config *cfg) {
 
 void kron_ec_close(KRON_EC_Config *cfg) {
     if (cfg) { cfg->is_operational = false; cfg->master_state = KRON_EC_MASTER_NONE; }
+    /* ⚠️ Nothing to close when init already closed it on a failure path —
+     * writing state to a closed port and calling ecx_close() twice is the
+     * double free described at kron_ec_close_ctx(). */
+    if (!g_ctx_open) return;
     g_ctx.slavelist[0].state = EC_STATE_INIT;
     ecx_writestate(&g_ctx, 0);
-    ecx_close(&g_ctx);
+    kron_ec_close_ctx();
     fprintf(stderr, "[kronec] EtherCAT master closed\n");
 }
 
