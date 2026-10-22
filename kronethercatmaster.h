@@ -77,11 +77,17 @@ typedef struct {
 } KRON_EC_PDO_Entry;
 
 /* ── SDO init command ─────────────────────────────────────────────────────── */
+/* What a startup SDO the slave refuses (after retries) does to the rest of the
+ * list. 0 = ABORT so a zeroed / older config stays on the safe side. */
+#define KRON_EC_SDO_ON_ERROR_ABORT  0   /* stop this slave's list, slave stays in PRE-OP */
+#define KRON_EC_SDO_ON_ERROR_NEXT   1   /* log it and continue with the next entry       */
+
 typedef struct {
     uint16_t  index;
     uint8_t   subindex;
     uint32_t  value;
     uint8_t   byte_size;   /* 1/2/4 bytes */
+    uint8_t   on_error;    /* KRON_EC_SDO_ON_ERROR_* */
 } KRON_EC_SDO;
 
 /* ── Per-slave configuration ─────────────────────────────────────────────── */
@@ -100,6 +106,14 @@ typedef struct {
     /* Runtime state (filled by kron_ec_init / kron_ec_check_state) */
     uint8_t           current_state;        /* EC_STATE_* from SOEM, or 0 */
     bool              link_up;              /* TRUE if slave is reachable  */
+    /* Last startup SDO the slave refused (0/0/0 = none). sdo_aborted = it was
+     * an ABORT entry, so the list stopped there and the slave stayed in PRE-OP.
+     * sdo_abort_code is the CoE abort code the slave sent; 0 = no answer
+     * (mailbox timeout — typically the slave was not in PRE-OP yet). */
+    bool              sdo_aborted;
+    uint16_t          sdo_err_index;
+    uint8_t           sdo_err_subindex;
+    uint32_t          sdo_abort_code;
 } KRON_EC_Slave;
 
 /* ── Master configuration ────────────────────────────────────────────────── */
@@ -238,6 +252,9 @@ typedef struct {
     uint16_t ErrorID;
     uint8_t  State;         /* EC_STATE_* of the specific slave */
     bool     LinkUp;        /* Slave is reachable */
+    uint16_t SdoIndex;      /* last startup SDO the slave refused, 0 = none */
+    uint8_t  SdoSubIndex;
+    uint32_t SdoAbortCode;  /* CoE abort code, 0 = no answer (timeout) */
     /* Internal */
     bool     _prevEnable;
 } EC_GetSlaveState;
@@ -328,6 +345,7 @@ static inline void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config 
     inst->ErrorID = 0;
     inst->State   = 0x08; /* EC_STATE_OPERATIONAL */
     inst->LinkUp  = true;
+    inst->SdoIndex = 0; inst->SdoSubIndex = 0; inst->SdoAbortCode = 0;
     (void)cfg;
 }
 

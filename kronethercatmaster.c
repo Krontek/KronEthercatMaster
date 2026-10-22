@@ -37,7 +37,23 @@ static KRON_EC_Config *g_cfg_ptr = NULL;
 
 /* SOEM is NOT thread-safe: ecx_SDOread/write and ecx_send/receive_processdata
  * share the same socket. This mutex serializes SDO and PDO access. */
-static pthread_mutex_t g_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* ⚠️ RECURSIVE, on purpose. kron_ec_check_state() holds it while calling
+ * ecx_reconfig_slave(), and SOEM calls the PO2SO hook from in there; the hook's
+ * SDO writes take it again. With a plain mutex the watchdog thread deadlocked
+ * on itself the first time a slave had to be reconfigured — no startup SDOs,
+ * and every thread that touches the bus hung behind it. */
+static pthread_mutex_t g_ctx_mutex;
+static pthread_once_t  g_ctx_mutex_once = PTHREAD_ONCE_INIT;
+
+static void ctx_mutex_init(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_ctx_mutex, &a);
+    pthread_mutexattr_destroy(&a);
+}
+static void ctx_lock(void)   { pthread_once(&g_ctx_mutex_once, ctx_mutex_init); pthread_mutex_lock(&g_ctx_mutex); }
+static void ctx_unlock(void) { pthread_mutex_unlock(&g_ctx_mutex); }
 
 /* ── Global SDO queue ─────────────────────────────────────────────────────── */
 static KRON_EC_SDO_Request sdo_queue[KRON_EC_MAX_SDO_QUEUE_SIZE];
@@ -95,10 +111,10 @@ static uint32_t slave_out_bytes(uint16_t pos) {
 
 static int do_sdo_write(uint16_t slave, uint16_t idx, uint8_t sub,
                         uint8_t bsz, uint32_t val) {
-    pthread_mutex_lock(&g_ctx_mutex);
+    ctx_lock();
     int wkc = ecx_SDOwrite(&g_ctx, slave, idx, sub, FALSE,
                            bsz, &val, EC_TIMEOUTRXM);
-    pthread_mutex_unlock(&g_ctx_mutex);
+    ctx_unlock();
     return (wkc > 0) ? KRON_EC_OK : KRON_EC_ERR_IO;
 }
 
@@ -106,9 +122,9 @@ static int do_sdo_read(uint16_t slave, uint16_t idx, uint8_t sub,
                        uint8_t bsz, uint32_t *out) {
     int sz = (int)bsz;
     uint32_t buf = 0;
-    pthread_mutex_lock(&g_ctx_mutex);
+    ctx_lock();
     int wkc = ecx_SDOread(&g_ctx, slave, idx, sub, FALSE, &sz, &buf, EC_TIMEOUTRXM);
-    pthread_mutex_unlock(&g_ctx_mutex);
+    ctx_unlock();
     if (wkc > 0) { *out = buf; return KRON_EC_OK; }
     return KRON_EC_ERR_IO;
 }
@@ -140,18 +156,112 @@ static void kron_ec_init_sdo_queue(void) {
 
 /* ── PO2SO hook — called by SOEM for each slave during PREOP→SAFEOP ─────── */
 
+/* ⚠️ SOEM waits for PRE-OP before calling this hook, but only EC_TIMEOUTSTATE
+ * (2 s) and it ignores the result. A drive that is slow to boot — typically the
+ * FIRST start after power-on — is still in INIT then, has no mailbox, and every
+ * startup SDO is aborted; the same project worked on the next Stop/Start, when
+ * the drive was already up. So: wait up to 3 s and retry each write. What still
+ * fails is handled per entry (KRON_EC_SDO.on_error, as in CODESYS' startup
+ * parameters): ABORT stops the slave's list and kron_ec_init keeps the bus in
+ * PRE-OP; NEXT logs it and carries on. Either way the slave records WHERE it
+ * failed and the CoE abort code, which EC_GetSlaveState reports. */
+#ifndef KRON_EC_PREOP_WAIT_US
+#  define KRON_EC_PREOP_WAIT_US    3000000    /* 3 s */
+#endif
+#ifndef KRON_EC_SDO_INIT_ATTEMPTS
+#  define KRON_EC_SDO_INIT_ATTEMPTS 5
+#endif
+#ifndef KRON_EC_SDO_INIT_RETRY_US
+#  define KRON_EC_SDO_INIT_RETRY_US 200000    /* 200 ms */
+#endif
+
+static int g_sdo_init_failed = 0;   /* reset by kron_ec_init before mapping */
+
+/* Drain SOEM's error list. Returns the CoE abort code of the last SDO error
+ * in it (the slave's own reason for refusing), 0 if the slave never answered. */
+static uint32_t ec_take_abort(ecx_contextt *ctx) {
+    uint32_t   code = 0;
+    ec_errort  e;
+    while (ecx_poperror(ctx, &e)) {
+        if (e.Etype == EC_ERR_TYPE_SDO_ERROR) code = (uint32_t)e.AbortCode;
+    }
+    return code;
+}
+
+static const char *ec_abort_text(uint32_t code) {
+    return code ? ec_sdoerror2string(code) : "no answer (mailbox timeout, slave not in PRE-OP?)";
+}
+
 static int kron_po2so_hook(ecx_contextt *ctx, uint16 slave) {
     if (!g_cfg_ptr) return 1;
+    KRON_EC_Slave *sl = NULL;
     for (int si = 0; si < g_cfg_ptr->slave_count; si++) {
-        KRON_EC_Slave *sl = &g_cfg_ptr->slaves[si];
-        if (sl->position != slave) continue;
-        for (int i = 0; i < sl->sdo_count; i++) {
-            KRON_EC_SDO *s = &sl->sdo_inits[i];
-            if (do_sdo_write(slave, s->index, s->subindex, s->byte_size, s->value) != KRON_EC_OK)
-                fprintf(stderr, "[kronec] PO2SO SDO failed: slave %d 0x%04X:%02X\n",
-                        slave, s->index, s->subindex);
+        if (g_cfg_ptr->slaves[si].position == slave) { sl = &g_cfg_ptr->slaves[si]; break; }
+    }
+    if (!sl) return 1;
+    sl->sdo_aborted      = false;
+    sl->sdo_err_index    = 0;
+    sl->sdo_err_subindex = 0;
+    sl->sdo_abort_code   = 0;
+    if (sl->sdo_count == 0) return 1;
+
+    uint16 st = ecx_statecheck(ctx, slave, EC_STATE_PRE_OP, KRON_EC_PREOP_WAIT_US);
+    if ((st & 0x0F) != EC_STATE_PRE_OP)
+        fprintf(stderr, "[kronec] Slave %d not in PRE-OP before startup SDOs (state=0x%02X) — "
+                        "writing anyway, expect aborts\n", slave, st);
+
+    for (int i = 0; i < sl->sdo_count; i++) {
+        KRON_EC_SDO *s = &sl->sdo_inits[i];
+        int      attempt, ok = 0;
+        uint32_t abort_code = 0;
+        (void)ec_take_abort(ctx);   /* start from a clean error list */
+        for (attempt = 1; attempt <= KRON_EC_SDO_INIT_ATTEMPTS; attempt++) {
+            if (do_sdo_write(slave, s->index, s->subindex, s->byte_size, s->value) == KRON_EC_OK) {
+                ok = 1;
+                break;
+            }
+            abort_code = ec_take_abort(ctx);
+            fprintf(stderr, "[kronec] Startup SDO slave %d 0x%04X:%02X = 0x%X (%u B) attempt %d/%d failed: "
+                            "abort 0x%08X %s\n",
+                    slave, s->index, s->subindex, (unsigned)s->value, s->byte_size,
+                    attempt, KRON_EC_SDO_INIT_ATTEMPTS, (unsigned)abort_code, ec_abort_text(abort_code));
+            usleep(KRON_EC_SDO_INIT_RETRY_US);
         }
-        break;
+        if (!ok) {
+            sl->sdo_err_index    = s->index;
+            sl->sdo_err_subindex = s->subindex;
+            sl->sdo_abort_code   = abort_code;
+            if (s->on_error == KRON_EC_SDO_ON_ERROR_NEXT) {
+                fprintf(stderr, "[kronec] Startup SDO slave %d entry %d/%d 0x%04X:%02X SKIPPED (on error: next line), "
+                                "abort 0x%08X %s\n",
+                        slave, i + 1, sl->sdo_count, s->index, s->subindex,
+                        (unsigned)abort_code, ec_abort_text(abort_code));
+                continue;
+            }
+            sl->sdo_aborted = true;
+            g_sdo_init_failed++;
+            fprintf(stderr, "[kronec] Startup SDO slave %d entry %d/%d 0x%04X:%02X ABORTED (on error: abort), "
+                            "abort 0x%08X %s — %d remaining entr%s not sent, slave stays in PRE-OP\n",
+                    slave, i + 1, sl->sdo_count, s->index, s->subindex,
+                    (unsigned)abort_code, ec_abort_text(abort_code),
+                    sl->sdo_count - i - 1, (sl->sdo_count - i - 1) == 1 ? "y" : "ies");
+            break;
+        }
+        if (attempt > 1)
+            fprintf(stderr, "[kronec] Startup SDO slave %d 0x%04X:%02X succeeded on attempt %d\n",
+                    slave, s->index, s->subindex, attempt);
+
+        /* Read back: a drive may ACK a write and keep (or clamp) another value.
+         * Only a warning — some objects are write-only or read back differently. */
+        uint32_t rb = 0;
+        if (do_sdo_read(slave, s->index, s->subindex, s->byte_size, &rb) == KRON_EC_OK) {
+            uint32_t mask = (s->byte_size >= 4) ? 0xFFFFFFFFu : ((1u << (8u * s->byte_size)) - 1u);
+            if ((rb & mask) != (s->value & mask))
+                fprintf(stderr, "[kronec] Startup SDO slave %d 0x%04X:%02X wrote 0x%X, reads back 0x%X\n",
+                        slave, s->index, s->subindex, (unsigned)(s->value & mask), (unsigned)(rb & mask));
+        } else {
+            (void)ec_take_abort(ctx);   /* drain the read abort, not a failure */
+        }
     }
     return 1;
 }
@@ -311,7 +421,35 @@ int kron_ec_init(KRON_EC_Config *cfg) {
         g_ctx.slavelist[i].PO2SOconfig = kron_po2so_hook;
     }
 
+    /* ⚠️ manualstatechange: left at 0, ecx_config_map_group() requests SAFE-OP
+     * for every slave itself as soon as the mapping is done — i.e. BEFORE the
+     * checks below could look at the startup SDOs. The slaves stay in PRE-OP
+     * until those checks pass and SAFE-OP is requested explicitly. */
+    g_sdo_init_failed = 0;
+    g_ctx.manualstatechange = 1;
     ecx_config_map_group(&g_ctx, g_IOmap, 0);
+    g_ctx.manualstatechange = 0;
+
+    /* A startup SDO the drive never accepted (after retries, see
+     * kron_po2so_hook) means the bus would run with the wrong mode / mapping /
+     * parameter while looking healthy. The slaves are left in PRE-OP. */
+    if (g_sdo_init_failed > 0) {
+        fprintf(stderr, "[kronec] %d slave(s) refused an ABORT startup SDO — bus stays in PRE-OP:\n",
+                g_sdo_init_failed);
+        for (int si = 0; si < cfg->slave_count; si++) {
+            KRON_EC_Slave *sl = &cfg->slaves[si];
+            if (sl->position >= 1 && sl->position <= (uint16_t)g_ctx.slavecount)
+                sl->current_state = (uint8_t)ecx_statecheck(&g_ctx, sl->position, EC_STATE_PRE_OP, EC_TIMEOUTRET);
+            sl->link_up = false;
+            if (!sl->sdo_aborted) continue;
+            fprintf(stderr, "[kronec]   slave %u '%s': 0x%04X:%02X abort 0x%08X %s\n",
+                    sl->position, sl->name, sl->sdo_err_index, sl->sdo_err_subindex,
+                    (unsigned)sl->sdo_abort_code, ec_abort_text(sl->sdo_abort_code));
+        }
+        kron_ec_close_ctx();
+        cfg->master_state = KRON_EC_MASTER_ERROR;
+        return KRON_EC_ERR_CONFIG;
+    }
 
     /* Refuse to run with a PDO list that does not fit the slaves' IOmap
      * segments — otherwise pdo_read/pdo_write would cross into a neighbour. */
@@ -320,6 +458,10 @@ int kron_ec_init(KRON_EC_Config *cfg) {
         cfg->master_state = KRON_EC_MASTER_ERROR;
         return KRON_EC_ERR_CONFIG;
     }
+
+    /* Both checks passed: now PRE-OP → SAFE-OP (what map_group used to do). */
+    g_ctx.slavelist[0].state = EC_STATE_SAFE_OP;
+    ecx_writestate(&g_ctx, 0);
 
     /* Distributed clocks.
      *
@@ -409,10 +551,10 @@ int kron_ec_init(KRON_EC_Config *cfg) {
 void kron_ec_pdo_read(KRON_EC_Config *cfg) {
     if (!cfg || !cfg->is_operational) return;
 
-    pthread_mutex_lock(&g_ctx_mutex);
+    ctx_lock();
     ecx_send_processdata(&g_ctx);
     ecx_receive_processdata(&g_ctx, EC_TIMEOUTRET);
-    pthread_mutex_unlock(&g_ctx_mutex);
+    ctx_unlock();
 
     /* Copy TxPDO (inputs) from IOmap → PLC variable pointers */
     for (int si = 0; si < cfg->slave_count; si++) {
@@ -479,7 +621,7 @@ void kron_ec_pdo_write(KRON_EC_Config *cfg) {
 void kron_ec_check_state(KRON_EC_Config *cfg) {
     if (!cfg) return;
 
-    pthread_mutex_lock(&g_ctx_mutex);
+    ctx_lock();
     for (int i = 1; i <= g_ctx.slavecount; i++) {
         uint16_t actual = ecx_statecheck(&g_ctx, i, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
 
@@ -488,8 +630,20 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
                     i, actual);
 
             if (ecx_recover_slave(&g_ctx, i, EC_TIMEOUTSAFE)) {
+                g_sdo_init_failed = 0;
                 ecx_reconfig_slave(&g_ctx, i, EC_TIMEOUTSAFE);
                 g_ctx.slavelist[i].islost = FALSE;
+                /* ⚠️ ecx_reconfig_slave() requests SAFE-OP right after the hook
+                 * whatever the hook reported — pull the slave back to PRE-OP and
+                 * leave it there rather than run it without its startup SDOs. */
+                if (g_sdo_init_failed > 0) {
+                    fprintf(stderr, "[kronec] Slave %d: %d startup SDO(s) failed on recovery — holding in PRE-OP\n",
+                            i, g_sdo_init_failed);
+                    g_ctx.slavelist[i].state = EC_STATE_PRE_OP;
+                    ecx_writestate(&g_ctx, i);
+                    g_ctx.slavelist[i].state = ecx_statecheck(&g_ctx, i, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
+                    continue;
+                }
                 ecx_statecheck(&g_ctx, i, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
             }
 
@@ -504,7 +658,7 @@ void kron_ec_check_state(KRON_EC_Config *cfg) {
                 fprintf(stderr, "[kronec] Slave %d recovery failed (state=0x%02X)\n", i, actual);
         }
     }
-    pthread_mutex_unlock(&g_ctx_mutex);
+    ctx_unlock();
 
     /* Count active slaves and update per-slave status */
     int active  = 0;
@@ -627,14 +781,23 @@ void EC_GetSlaveState_Call(EC_GetSlaveState *inst, KRON_EC_Config *cfg) {
     inst->ErrorID = 0;
     inst->State   = 0;
     inst->LinkUp  = false;
+    inst->SdoIndex = 0; inst->SdoSubIndex = 0; inst->SdoAbortCode = 0;
 
     if (!inst->Enable || !cfg) { inst->_prevEnable = inst->Enable; return; }
 
     /* Look up matching configured slave */
     for (int si = 0; si < cfg->slave_count; si++) {
         if (cfg->slaves[si].position == inst->SlaveAddress) {
-            inst->State  = cfg->slaves[si].current_state;
-            inst->LinkUp = cfg->slaves[si].link_up;
+            KRON_EC_Slave *sl = &cfg->slaves[si];
+            inst->State        = sl->current_state;
+            inst->LinkUp       = sl->link_up;
+            inst->SdoIndex     = sl->sdo_err_index;
+            inst->SdoSubIndex  = sl->sdo_err_subindex;
+            inst->SdoAbortCode = sl->sdo_abort_code;
+            if (sl->sdo_aborted) {
+                inst->Error   = true;
+                inst->ErrorID = 2; /* ERR_STARTUP_SDO: an ABORT startup SDO was refused */
+            }
             inst->Valid  = true;
             inst->_prevEnable = inst->Enable;
             return;
